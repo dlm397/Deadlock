@@ -1,0 +1,8 @@
+{
+  "name": "deadlock-research-replay-export",
+  "private": true,
+  "type": "module",
+  "description": "Existing deadem parser bridge for the Python research pipeline",
+  "dependencies": { "deadem": "4.0.1" },
+  "engines": { "node": ">=18" }
+}
