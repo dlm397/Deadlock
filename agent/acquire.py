@@ -1,15 +1,16 @@
 import bz2
-import json
+import hashlib
 import tempfile
 import logging
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import zstandard
 
 from .quality import audit_demo_schema
-from .io import save_json, read_json
+from .io import checksum, save_json, read_json
 
 LOG = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ def select_matches(api, n, match_ids, completed=None, require_replay=True):
     try:
         while True:
             before = f" AND match_id < {cursor}" if cursor is not None else ""
-            query = ("SELECT DISTINCT match_id FROM match_salts WHERE replay_salt IS NOT NULL "
+            query = ("SELECT DISTINCT match_id FROM match_salts WHERE replay_salt IS NOT NULL AND metadata_salt IS NOT NULL "
                      f"AND cluster_id IS NOT NULL{before} ORDER BY match_id DESC LIMIT {limit}")
             rows = api.lake_query(query)
             save_json(api.root / "tables/sources/selection/replay_candidates.json",
@@ -133,74 +134,100 @@ def query_demo(api, mid, schema):
     raise TimeoutError(f"Demo query job {job['job_id']} did not finish in 15 minutes")
 
 
-def acquire_replay(api, mid, interval, save_demo=True, parse=True, query=True):
-    result = {"replay_available": False, "replay_parsed": False, "errors": []}
-    folder = api.root / "raw" / str(mid) / "sources/schema"
+def compatible_local_replay(out, interval):
+    out = Path(out)
+    previous = read_json(out / "summary.json", {})
+    script = Path(__file__).resolve().parent / "replay/export.mjs"
+    if (previous.get("success") and previous.get("sample_interval") == interval
+            and previous.get("exporter_sha256") == hashlib.sha256(script.read_bytes()).hexdigest()
+            and all((out / name).exists() for name in
+                    ("player_state.ndjson.gz", "events.ndjson.gz", "entity_samples.ndjson.gz"))
+            and read_json(out / "schema.json")):
+        return previous
+    return None
+
+
+def audit_replay(api, mid, folder, query):
+    started = time.perf_counter()
+    result = {"replay_available": False, "errors": []}
     schema = None
-    salts = {}
-    compressed = folder.parent / "replay.dem.bz2"
-    out = folder.parent / "replay"
     try:
-        salts = get_salts(api, mid)
-        result["demo_url"] = salts.get("demo_url")
-    except Exception as exc:
-        result["errors"].append(f"salts: {exc}")
-    try:
-        # Only ask for a schema when a replay salt is known: avoids Steam fallback.
-        if salts.get("demo_url"):
-            schema, _ = api.json("/v1/matches/demo/schema", f"raw/{mid}/sources/schema/api_demo_schema.json", params={"match_id": mid}, cached=True)
-            audit_demo_schema(schema, folder)
-            result["replay_available"] = True
+        schema, _ = api.json("/v1/matches/demo/schema", f"raw/{mid}/sources/schema/api_demo_schema.json",
+                             params={"match_id": mid}, cached=True)
+        audit_demo_schema(schema, folder)
+        result["replay_available"] = True
     except Exception as exc:
         result["errors"].append(f"demo schema: {exc}")
         LOG.warning("Match %s demo schema: %s", mid, exc)
-    url = salts.get("demo_url") or (schema or {}).get("demo_url")
-    if not url and not compressed.exists():
+    if query and schema:
+        try:
+            result["demo_query"] = query_demo(api, mid, schema)
+        except Exception as exc:
+            result["errors"].append(f"API demo query: {exc}")
+            LOG.warning("Match %s API demo query failed: %s", mid, exc)
+    result["elapsed_seconds"] = time.perf_counter() - started
+    return result
+
+
+def acquire_local_replay(api, mid, interval, save_demo, parse, result, download_error=None):
+    folder = api.root / "raw" / str(mid) / "sources"
+    compressed, out = folder / "replay.dem.bz2", folder / "replay"
+    url = result.get("demo_url")
+    previous = compatible_local_replay(out, interval) if parse else None
+    if previous:
+        result.update(parser_summary=previous, replay_parsed=True, parser_output=str(out),
+                      replay_available=True, parser_reused=True)
+        LOG.info("Match %s: reusing compatible replay extracts", mid)
+    if not url and not compressed.exists() and not previous:
         result["unavailable_reason"] = "No replay URL is available for this match; metadata availability does not imply replay availability"
-    if (url or compressed.exists()) and (save_demo or parse):
+    if (url or compressed.exists()) and (save_demo or parse and not previous):
         expanded = compressed.with_suffix("")
         try:
-            if url:
-                LOG.info("Match %s: downloading replay", mid)
-                api.download(url, compressed)
+            if download_error is not None:
+                record = read_json(compressed.with_suffix(compressed.suffix + ".provenance.json"), {})
+                if not compressed.exists() or record.get("sha256") != checksum(compressed):
+                    raise download_error
+                LOG.info("Match %s: using verified local replay after prefetch failed", mid)
+            elif url:
+                started = time.perf_counter()
+                try:
+                    api.download(url, compressed)
+                finally:
+                    result["timings_seconds"]["download"] = time.perf_counter() - started
             result["replay_available"] = True
             result["demo_bytes"] = compressed.stat().st_size
-            previous_summary = out / "summary.json"
-            if parse and read_json(previous_summary):
-                previous = read_json(previous_summary)
-                # Avoid re-parsing an already successful local artifact with the
-                # same interval and exporter. No partial/resumable processing.
-                import hashlib
-                script = Path(__file__).resolve().parent / "replay/export.mjs"
-                if (previous.get("success") and previous.get("sample_interval") == interval
-                        and previous.get("exporter_sha256") == hashlib.sha256(script.read_bytes()).hexdigest()
-                        and all((out / name).exists() for name in ("player_state.ndjson.gz", "events.ndjson.gz", "entity_samples.ndjson.gz"))
-                        and read_json(out / "schema.json")):
-                    result.update(parser_summary=previous, replay_parsed=True, parser_output=str(out))
             if parse and not result["replay_parsed"]:
-                decompress_demo(compressed, expanded)
+                started = time.perf_counter()
+                try:
+                    decompress_demo(compressed, expanded)
+                finally:
+                    result["timings_seconds"]["decompress"] = time.perf_counter() - started
                 out.mkdir(parents=True, exist_ok=True)
                 script = Path(__file__).resolve().parent / "replay/export.mjs"
                 LOG.info("Match %s: parsing replay locally", mid)
-                logpath = folder.parent / "parser.log"
+                logpath = folder / "parser.log"
                 logpath.parent.mkdir(parents=True, exist_ok=True)
                 if not (script.parent / "node_modules/deadem").exists():
                     subprocess.run(["npm.cmd" if __import__("os").name == "nt" else "npm", "ci",
                                     "--ignore-scripts", "--no-audit", "--no-fund"],
                                    cwd=script.parent, check=True, timeout=300)
-                with tempfile.TemporaryDirectory(prefix=".parse-", dir=folder.parent) as temporary:
+                with tempfile.TemporaryDirectory(prefix=".parse-", dir=folder) as temporary:
                     staging = Path(temporary) / "replay"
                     staging.mkdir()
                     with logpath.open("w", encoding="utf-8") as log:
-                        proc = subprocess.run(["node", "--max-old-space-size=6144", str(script),
-                                               str(expanded.resolve()), str(staging.resolve()), str(interval)],
-                                              stdout=log, stderr=subprocess.STDOUT, timeout=1200)
+                        started = time.perf_counter()
+                        try:
+                            proc = subprocess.run(["node", "--max-old-space-size=6144", str(script),
+                                                   str(expanded.resolve()), str(staging.resolve()), str(interval)],
+                                                  stdout=log, stderr=subprocess.STDOUT, timeout=1200)
+                        finally:
+                            result["timings_seconds"]["parse"] = time.perf_counter() - started
                     summary = read_json(staging / "summary.json", {})
                     required = ("player_state.ndjson.gz", "events.ndjson.gz", "entity_samples.ndjson.gz", "schema.json")
                     if proc.returncode or not summary.get("success") or not all((staging / name).exists() for name in required):
                         raise RuntimeError(f"Parser failed; see {logpath}")
-                    out.resolve().relative_to(folder.parent.resolve())
-                    staging.resolve().relative_to(folder.parent.resolve())
+                    out.resolve().relative_to(folder.resolve())
+                    staging.resolve().relative_to(folder.resolve())
                     previous = Path(temporary) / "previous"
                     if out.exists():
                         out.replace(previous)
@@ -218,12 +245,57 @@ def acquire_replay(api, mid, interval, save_demo=True, parse=True, query=True):
             expanded.unlink(missing_ok=True)
             if not save_demo:
                 compressed.unlink(missing_ok=True)
-    if query and schema:
-        try:
-            result["demo_query"] = query_demo(api, mid, schema)
-        except Exception as exc:
-            result["errors"].append(f"API demo query: {exc}")
-            LOG.warning("Match %s API demo query failed: %s", mid, exc)
+    elif previous:
+        record = read_json(compressed.with_suffix(compressed.suffix + ".provenance.json"), {})
+        result["demo_bytes"] = compressed.stat().st_size if compressed.exists() else record.get("bytes", 0)
+        if not save_demo:
+            compressed.unlink(missing_ok=True)
+
+
+def acquire_replay(api, mid, interval, save_demo=True, parse=True, query=True, prefetched_salts=None,
+                   prefetched_errors=None):
+    started = time.perf_counter()
+    result = {"replay_available": False, "replay_parsed": False, "errors": [],
+              "timings_seconds": {"download": 0.0, "decompress": 0.0, "parse": 0.0, "remote_audit": 0.0}}
+    folder = api.root / "raw" / str(mid) / "sources/schema"
+    prefetched_errors = prefetched_errors or {}
+    try:
+        if "salts" in prefetched_errors:
+            result["errors"].append(f"salts: {prefetched_errors['salts']}")
+            salts = prefetched_salts or {}
+        else:
+            salts = get_salts(api, mid) if prefetched_salts is None else prefetched_salts
+        result["demo_url"] = salts.get("demo_url")
+    except Exception as exc:
+        result["errors"].append(f"salts: {exc}")
+    # A separate session keeps network audit work independent of local parsing.
+    remote_api, executor, future = None, None, None
+    if result.get("demo_url") and callable(getattr(api, "fork", None)):
+        remote_api = api.fork()
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="replay-audit")
+        future = executor.submit(audit_replay, remote_api, mid, folder, query)
+    try:
+        acquire_local_replay(api, mid, interval, save_demo, parse, result, prefetched_errors.get("download"))
+        remote = None
+        if future:
+            remote = future.result()
+        elif result.get("demo_url"):
+            remote = audit_replay(api, mid, folder, query)
+        if remote:
+            result["replay_available"] |= remote["replay_available"]
+            result["errors"].extend(remote["errors"])
+            result["timings_seconds"]["remote_audit"] = remote["elapsed_seconds"]
+            if "demo_query" in remote:
+                result["demo_query"] = remote["demo_query"]
+    finally:
+        if executor:
+            executor.shutdown(wait=True)
+            api.requests.extend(remote_api.requests)
+            remote_api.session.close()
+    result["timings_seconds"]["total"] = time.perf_counter() - started
+    LOG.info("Match %s replay timings: %s", mid,
+             ", ".join(f"{'download/cache' if name == 'download' else name}={elapsed:.1f}s"
+                       for name, elapsed in result["timings_seconds"].items()))
     save_json(folder / "replay_status.json", result)
     return result
 

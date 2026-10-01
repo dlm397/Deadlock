@@ -3,21 +3,28 @@ import hashlib
 import io
 import json
 import logging
+import re
 import shutil
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from threading import Event
 
 import pandas as pd
 import requests
+
+from .lake_response import LakeUnavailable, query_rows
 
 BASE = "https://api.deadlock-api.com"
 LOG = logging.getLogger(__name__)
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 RETRY_DELAYS_SECONDS = (2, 4, 60)  # Last retry outlasts the API's one-minute failure cache.
+PARALLEL_DOWNLOAD_MIN_BYTES = 16 * 1024 * 1024
+DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 GROUPS = {
     "summaries": ("matches", "players", "game_versions", "metadata_teams", "metadata_damage",
                   "metadata_custom_stats", "metadata_gold_sources"),
@@ -60,8 +67,25 @@ def checksum(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def _retry_after_seconds(response):
+    header = response.headers.get("Retry-After") if response is not None else None
+    if not header:
+        return 0
+    try:
+        return float(header)
+    except ValueError:
+        try:
+            return (parsedate_to_datetime(header) - datetime.now(timezone.utc)).total_seconds()
+        except (ValueError, TypeError, OverflowError):
+            return 0
+
+
+class _RangeUnavailable(ValueError):
+    pass
+
+
 class API:
-    def __init__(self, root, save_raw=True):
+    def __init__(self, root, save_raw=True, download_workers=4):
         self.root = Path(root)
         self.save_raw = save_raw
         self.session = requests.Session()
@@ -69,6 +93,12 @@ class API:
         self.requests = []
         self.mcp_headers = {"Accept": "application/json, text/event-stream"}
         self.mcp_ready = False
+        self.download_workers = download_workers
+
+    def fork(self):
+        child = API(self.root, self.save_raw, self.download_workers)
+        child.session.headers.update(self.session.headers)
+        return child
 
     def _retry(self, operation, description, retry=True):
         for attempt in range(len(RETRY_DELAYS_SECONDS) + 1):
@@ -82,19 +112,11 @@ class API:
                         or isinstance(exc, requests.HTTPError) and status not in RETRY_STATUSES):
                     raise
                 delay = RETRY_DELAYS_SECONDS[attempt]
-                header = response.headers.get("Retry-After") if response is not None else None
-                if header:
-                    try:
-                        requested = float(header)
-                    except ValueError:
-                        try:
-                            requested = (parsedate_to_datetime(header) - datetime.now(timezone.utc)).total_seconds()
-                        except (ValueError, TypeError, OverflowError):
-                            requested = 0
-                    if requested > 60:
-                        LOG.warning("%s: server requests a %.0fs wait; deferring this request", description, requested)
-                        raise
-                    delay = max(delay, requested)
+                requested = _retry_after_seconds(response)
+                if requested > 60:
+                    LOG.warning("%s: server requests a %.0fs wait; deferring this request", description, requested)
+                    raise
+                delay = max(delay, requested)
                 if response is not None:
                     response.close()
                 LOG.warning("%s: %s; retry %s/%s in %gs", description,
@@ -115,21 +137,30 @@ class API:
             self.mcp_headers["Mcp-Session-Id"] = response.headers["Mcp-Session-Id"]
         if notification:
             return
-        if response.text.lstrip().startswith("{"):
-            messages = [response.json()]
-        else:
-            # Streamable HTTP can wrap a JSON-RPC response in an SSE event.
-            messages = []
-            for event in response.text.replace("\r\n", "\n").split("\n\n"):
-                data = "\n".join(line[5:].lstrip() for line in event.splitlines() if line.startswith("data:"))
-                if data:
-                    messages.append(json.loads(data))
-        message = next((item for item in messages if item.get("id") == body["id"]), {})
-        if "error" in message or "result" not in message:
-            raise RuntimeError(f"Data lake request failed: {message.get('error', 'missing RPC result')}")
+        try:
+            if response.text.lstrip().startswith("{"):
+                messages = [response.json()]
+            else:
+                # Streamable HTTP can wrap a JSON-RPC response in an SSE event.
+                messages = []
+                for event in response.text.replace("\r\n", "\n").split("\n\n"):
+                    data = "\n".join(line[5:].lstrip() for line in event.splitlines() if line.startswith("data:"))
+                    if data:
+                        messages.append(json.loads(data))
+        except ValueError as exc:
+            raise LakeUnavailable("Data lake returned malformed JSON-RPC data", response=response) from exc
+        message = next((item for item in messages if isinstance(item, dict) and item.get("id") == body["id"]), {})
+        if "error" in message:
+            raise RuntimeError(f"Data lake request failed: {message['error']}")
+        if "result" not in message:
+            raise LakeUnavailable("Data lake returned no JSON-RPC result", response=response)
         return message["result"]
 
     def lake_query(self, sql):
+        # SQL reads are safe to retry; demo-job POST submissions still are not.
+        return self._retry(lambda: self._lake_query(sql), "Data lake query")
+
+    def _lake_query(self, sql):
         if not self.mcp_ready:
             result = self._rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
                                                "clientInfo": {"name": "deadlock-local-research", "version": "0.2"}})
@@ -137,15 +168,7 @@ class API:
             self._rpc("notifications/initialized", notification=True)
             self.mcp_ready = True
         result = self._rpc("tools/call", {"name": "execute_query", "arguments": {"sql": sql}})
-        text = result.get("structuredContent", {}).get("result")
-        if text is None:
-            text = next((item["text"] for item in result.get("content", []) if item.get("type") == "text"), "")
-        if result.get("isError"):
-            raise RuntimeError(f"Data lake query failed: {text[:500]}")
-        table = json.loads(text)
-        if not table.get("success"):
-            raise RuntimeError(f"Data lake query failed: {table.get('error', table)}")
-        return [dict(zip(table["columns"], row, strict=True)) for row in table["rows"]]
+        return query_rows(result)
 
     def json(self, path, filename=None, params=None, body=None, required_archive=False, cached=False):
         out = self.root / filename if filename else None
@@ -174,22 +197,127 @@ class API:
             save_json(out.with_suffix(out.suffix + ".provenance.json"), record)
         return payload, dict(source=response.url, retrieved_at=record["retrieved_at"])
 
-    def download(self, url, target):
+    def _download_ranges(self, url, temporary, size, validator, workers):
+        cancelled = Event()
+        with temporary.open("wb") as dest:
+            dest.truncate(size)
+
+        def fetch_range(start, end):
+            headers = {**self.session.headers, "Accept-Encoding": "identity",
+                       "Range": f"bytes={start}-{end}", "If-Range": validator[1]}
+            with requests.Session() as session:
+                with session.get(url, headers=headers, stream=True, timeout=(20, 180)) as response:
+                    if response.status_code in (200, 412, 416):
+                        raise _RangeUnavailable("server declined a byte range")
+                    response.raise_for_status()
+                    actual_range = response.headers.get("Content-Range", "")
+                    encoding = response.headers.get("Content-Encoding", "identity").lower()
+                    if (response.status_code != 206 or actual_range != f"bytes {start}-{end}/{size}"
+                            or encoding != "identity" or response.headers.get(validator[0]) != validator[1]):
+                        raise _RangeUnavailable("range headers or entity validator changed")
+                    expected = end - start + 1
+                    content_length = response.headers.get("Content-Length")
+                    if content_length is not None and content_length != str(expected):
+                        raise _RangeUnavailable("incorrect range Content-Length")
+                    received = 0
+                    with temporary.open("r+b") as dest:
+                        dest.seek(start)
+                        for chunk in response.iter_content(DOWNLOAD_CHUNK_BYTES):
+                            if cancelled.is_set():
+                                return
+                            received += len(chunk)
+                            if received > expected:
+                                raise _RangeUnavailable("range body exceeds requested length")
+                            dest.write(chunk)
+                    if received != expected:
+                        raise _RangeUnavailable("incomplete range body")
+
+        # Each worker owns its connection and writes only its disjoint byte range.
+        failure = None
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="replay-range") as pool:
+            futures = [pool.submit(fetch_range, size * index // workers, size * (index + 1) // workers - 1)
+                       for index in range(workers)]
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except BaseException as exc:
+                failure = exc
+                cancelled.set()
+                for future in futures:
+                    future.cancel()
+        if failure is not None:
+            if isinstance(failure, Exception):
+                errors = [future.exception() for future in futures if not future.cancelled()]
+                http_errors = [exc for exc in errors if isinstance(exc, requests.HTTPError)]
+                if http_errors:
+                    # A simultaneous throttle takes precedence over a range fallback.
+                    failure = max(http_errors, key=lambda exc: _retry_after_seconds(exc.response))
+            raise failure
+        return checksum(temporary)
+
+    def download(self, url, target, workers=None):
+        workers = self.download_workers if workers is None else workers
+        if not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= 8:
+            raise ValueError("download workers must be an integer between 1 and 8")
         target = Path(target)
+        label = f"match {target.parent.parent.name} replay" if target.name == "replay.dem.bz2" else target.name
         target.parent.mkdir(parents=True, exist_ok=True)
         sidecar = target.with_suffix(target.suffix + ".provenance.json")
         record = read_json(sidecar, {})
         if target.exists() and record.get("sha256") == checksum(target):
+            LOG.info("Reusing verified cached download: %s", label)
             return target
         temporary = target.with_suffix(target.suffix + ".part")
+        parallel_allowed = workers > 1
+
         def fetch():
+            nonlocal parallel_allowed
             digest = hashlib.sha256()
-            with self.session.get(url, stream=True, timeout=(20, 180)) as response:
+            with self.session.get(url, headers={"Accept-Encoding": "identity"}, stream=True,
+                                  timeout=(20, 180)) as response:
                 response.raise_for_status()
+                source = response.url
+                length = response.headers.get("Content-Length", "")
+                size = int(length) if length.isdigit() else None
+                identity = response.headers.get("Content-Encoding", "identity").lower() == "identity"
+                etag = response.headers.get("ETag", "")
+                modified = response.headers.get("Last-Modified", "")
+                validator = ("ETag", etag) if re.fullmatch(r'"[^"\r\n]+"', etag) else None
+                if validator is None and modified:
+                    try:
+                        if parsedate_to_datetime(modified).tzinfo is not None:
+                            validator = ("Last-Modified", modified)
+                    except (ValueError, TypeError, OverflowError):
+                        pass
+                use_ranges = (parallel_allowed and response.status_code == 200 and identity
+                              and size is not None and size >= PARALLEL_DOWNLOAD_MIN_BYTES
+                              and response.headers.get("Accept-Ranges", "").lower() == "bytes" and validator)
+                if use_ranges:
+                    response.close()
+                    LOG.info("Downloading %s: %.1f MiB with %s parallel streams", label, size / 1024**2, workers)
+                    try:
+                        sha256 = self._download_ranges(source, temporary, size, validator, workers)
+                    except _RangeUnavailable as exc:
+                        parallel_allowed = False
+                        LOG.info("Replay range download unavailable (%s); using one stream", exc)
+                        return fetch()
+                    except requests.RequestException:
+                        # The existing retry policy waits before restarting in one stream.
+                        parallel_allowed = False
+                        raise
+                    record = dict(source=source, retrieved_at=now(), bytes=size, sha256=sha256)
+                    temporary.replace(target)
+                    save_json(sidecar, record)
+                    return target
+                if response.status_code != 200 or response.headers.get("Content-Range"):
+                    raise requests.exceptions.ChunkedEncodingError("Expected a complete replay response")
+                LOG.info("Downloading %s: one stream", label)
                 with temporary.open("wb") as dest:
-                    for chunk in response.iter_content(1024 * 1024):
+                    for chunk in response.iter_content(DOWNLOAD_CHUNK_BYTES):
                         dest.write(chunk)
                         digest.update(chunk)
+                if identity and size is not None and temporary.stat().st_size != size:
+                    raise requests.exceptions.ChunkedEncodingError("Incomplete replay download")
                 record = dict(source=response.url, retrieved_at=now(), bytes=temporary.stat().st_size,
                               sha256=digest.hexdigest())
             temporary.replace(target)

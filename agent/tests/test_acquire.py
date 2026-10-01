@@ -1,4 +1,5 @@
 import re
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -81,9 +82,30 @@ class AcquireTests(unittest.TestCase):
         self.assertGreaterEqual(len(queries), 2)
         self.assertNotIn("/v1/sql", self.api.network_calls)
 
+    def test_lake_requires_complete_salts_on_one_row_without_id_ceiling(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE match_salts (match_id INTEGER, cluster_id INTEGER, metadata_salt INTEGER, replay_salt INTEGER)")
+        connection.executemany("INSERT INTO match_salts VALUES (?, ?, ?, ?)", [
+            (99999999999, 183, None, 123),
+            (99999999999, 404, 1, None),
+            (108314586, 390, 725090163, 101842092),
+            (108314586, 390, 725090163, 101842092),
+            (108313916, 185, 554170297, 934431646),
+            (108313900, None, 20, 30),
+            (100000000000, 185, 40, 50),
+        ])
+        self.api.lake_query.side_effect = lambda query: [
+            {"match_id": row[0]} for row in connection.execute(query).fetchall()]
+        self.api.responses["/v1/matches/recently-fetched"] = []
+        selected = list(acquire.select_matches(self.api, 5, None))
+        self.assertEqual(selected, [100000000000, 108314586, 108313916])
+        self.assertEqual(self.api.lake_query.call_count, 1)
+        self.assertFalse(any("/metadata" in path or "/salts" in path for path in self.api.network_calls))
+
     def test_explicit_ids_do_not_use_discovery(self):
-        selected = list(acquire.select_matches(self.api, 50, [1, "2", 1]))
-        self.assertEqual(selected, [1, 2])
+        selected = list(acquire.select_matches(self.api, 50, [1, "2", 99999999999, 1]))
+        self.assertEqual(selected, [1, 2, 99999999999])
         self.api.lake_query.assert_not_called()
         self.api.json.assert_not_called()
 

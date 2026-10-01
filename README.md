@@ -1,6 +1,6 @@
 # Deadlock research dataset
 
-Edit [main.py](main.py), run [collect.py](collect.py), and read saved tables through [dataset.py](dataset.py). Collection downloads, parses, normalizes, validates, and saves **one match at a time** before moving to the next. A failed match is logged and skipped. [analysis.py](analysis.py) optionally creates five descriptive plots for one match.
+Edit [main.py](main.py), run [collect.py](collect.py), and read saved tables through [dataset.py](dataset.py). Collection parses, normalizes, validates, and saves **one match at a time**, while prefetching the next compressed replay. Independent remote auditing runs alongside local replay work. A failed match is logged and skipped. [analysis.py](analysis.py) optionally creates five descriptive plots for one match.
 
 **Setup and collection**
 
@@ -25,12 +25,63 @@ Node dependencies are installed automatically with `npm ci` when first needed. T
 | `SAVE_RAW_DEMOS`, `SAVE_RAW_JSON` | Retain original sources; keep both `True` for reproducible future extraction. |
 | `PARSE_REPLAYS` | Parse replay state; keep `True` for the richer dataset. |
 | `QUERY_DEMO_API` | Optional independent replay kill-count check; public API limits can delay or prevent it. |
+| `PREFETCH` | Default `True`: prepare at most one next match while the current match is processed. `False` disables lookahead. |
+| `DOWNLOAD_WORKERS` | Default `4`: parallel byte-range streams for large replays when supported. Use `1` for one stream; maximum `8`. |
 
-Completed matches with the same code/settings fingerprint are skipped; automatic selection excludes them. Rebuilding one match replaces only its own bundles. Automatic selection queries the [public data lake](https://deadlock-api.com/data-dumps) for replay-backed matches; its hourly snapshot can lag the newest matches. Recent-match fallback checks replay availability before selecting a match. Normal, 12-player games lasting at least 15 minutes are required: this is a convenience sample, not a random population sample. Missing replays are skipped, and an exhausted candidate search reports how many requested matches were saved.
+Completed matches with the same code/settings fingerprint are skipped; automatic selection excludes them. Completion checks are cached within each run to avoid repeatedly hashing the same bundles. `REPROCESS=True` overrides skipping. Rebuilding one match replaces only its own bundles. Automatic selection queries the [public data lake](https://deadlock-api.com/data-dumps) for rows containing both metadata and replay salts plus a cluster ID; its hourly snapshot can lag the newest matches. Recent-match fallback checks replay availability before selecting a match. Normal, 12-player games lasting at least 15 minutes are required: this is a convenience sample, not a random population sample. Missing replays are skipped, and an exhausted candidate search reports how many requested matches were saved.
 
 GET requests and interrupted replay downloads retry up to three times for temporary connection errors and HTTP 429/500/502/503/504 responses, with waits of 2, 4, and 60 seconds. `Retry-After` is respected; waits longer than 60 seconds defer that request to a later run. Failed matches are logged and collection continues. Missing replay URLs and eligibility-filter skips are expected; retries cannot create unavailable source data. POST job submissions are not automatically retried.
 
+Both collectors accept the data lake's JSON and TOON SQL result formats. Read-only SQL queries also retry temporary HTTP failures, empty RPC responses, and the server's `NotReadyError` while its snapshot catalog loads. Malformed or truncated tables are rejected rather than treated as empty results; SQL errors retain the server's explanation. These retries do not resubmit replay audit jobs.
+
+The speed settings keep all existing fields, schema audits, optional API query checks, source archives, and compression levels. Parallel downloads stream disjoint ranges to disk, verify response lengths and server validators, and fall back to one stream if needed. Each worker has its own HTTP session. Only one local parser and one match's normalized tables are active; completed work is saved before processing the next match. Successful API queries and compatible replay extracts are reused, and decoded reference definitions are cached for up to two versions per run. Stage timings are written to each match's status and replay status; `tables/last_run.json` includes elapsed time and speed settings. The `prefetch_download` timing records download/cache preparation before processing; the later `download` timing includes local checksum verification and can be very short because the replay is already cached. Logs distinguish cached reuse from network transfers. Timings can overlap and should not be summed as wall time.
+
 To apply cleaning changes locally, set `OFFLINE = True`, `REPROCESS = True`, then run `collect.py`. With `MATCH_IDS = None`, offline mode visits every archived match and ignores `N_MATCHES`. To change the sampling interval, use `OFFLINE = False` and select the affected match IDs so the demos can be reparsed. Set `OFFLINE` back to `False` when collecting new matches.
+
+**Lake collection without replays**
+
+Edit the settings at the top of [collect_lake.py](collect_lake.py), then run:
+
+```powershell
+.\.venv\Scripts\python.exe collect_lake.py
+```
+
+This separate collector writes to `data/lake` and leaves replay collection and `data/raw` alone. It downloads **every column** in the lake's `match_player` and `match_salts` tables: currently 151 and 5 columns. That includes final match/player results, item and upgrade histories, death details, objective records, statistics time series, tracked stats, rank fields, and every other exposed field. Source names and missing values are retained. The column list is discovered on each run, so new upstream columns are included automatically. Steam profile histories and leaderboard tables are not match records and are not collected.
+
+| Setting in `collect_lake.py` | Behavior |
+|---|---|
+| `N_MATCHES` | Additional successful matches to save; completed matches and failures do not consume the target. |
+| `MATCH_IDS` | Explicit IDs; overrides the count and automatic selection filters. |
+| `GAME_MODE`, `MATCH_MODE` | Source enum names, e.g. `"Normal"`, `"StreetBrawl"`, `"Ranked"`; `None` removes the filter. |
+| `MIN_DURATION_S`, `EXPECTED_PLAYERS` | Defaults: at least 900 seconds and 12 distinct player slots. Use `0` and `None` to remove these restrictions. |
+| `START_DATE`, `END_DATE` | Match start-time interval, inclusive start and exclusive end. ISO dates/times; naive values are UTC. |
+| `MIN_MATCH_ID`, `MAX_MATCH_ID` | Inclusive ID bounds; discovery proceeds newest ID first. |
+| `REPROCESS` | Replace existing lake matches after successful retrieval; otherwise valid saved matches are skipped. |
+| `PAGE_SIZE`, `MAX_CANDIDATES` | Discovery query size and limit on new attempted matches. The automatic candidate limit defaults to `max(100, N_MATCHES * 10)`. |
+| `REQUEST_DELAY` | Optional minimum interval between SQL queries, in seconds. HTTP retries retain the existing backoff policy. |
+| `OUTPUT_DIR`, `COMPRESSION_LEVEL` | Default `./data/lake`, with lossless Zstandard level 19. |
+
+Each match has `<match_id>/match_player.parquet`, `match_salts.parquet`, and `status.json.gz`. The status records all source schemas, column encodings, checksums, row counts, and provenance; request logs are compressed alongside them. `tables/` holds the observed manifest and schemas; `last_run.json` summarizes the run. Both tables are staged before replacing an existing saved match. Failures are recorded and the next match is attempted.
+
+The SQL service caps response size. Full records are transferred in bounded chunks with checksums, byte-length checks, column checks, and source-inventory checks. The collector holds only one match at a time and retains **all source versions and exact duplicate rows**. Those rows must not be treated as independent players in statistical models. The live lake updates periodically; the observed manifest is archived for context, but the MCP queries are not pinned to that manifest. A table that changes during retrieval is rejected for a later retry.
+
+```python
+import json
+from dataset import lake_match_ids, read_lake_match, iter_lake_matches
+
+mid = lake_match_ids()[0]
+players = read_lake_match(mid)  # Every stored version; nested values are JSON strings.
+distinct_records = players.drop_duplicates()
+economy = read_lake_match(mid, columns=["match_id", "player_slot", "net_worth", "created_at"])
+history = json.loads(players.iloc[0]["stats.net_worth"])
+times = json.loads(players.iloc[0]["stats.time_stamp_s"])
+
+for mid, players in iter_lake_matches():
+    # Construct study features one match at a time.
+    pass
+```
+
+Lake reader `output_dir` is the parent dataset directory (`./data`), consistent with the existing readers. For a custom location, keep the `lake` subdirectory, e.g. collect to `./study/lake` and read with `output_dir="./study"`. Enums retain their source names (`"Team0"`, `"Normal"`); timestamps retain their source text; integer IDs retain exact nullable integer types. Inspect `created_at` when deciding which source revision to analyze after removing exact duplicates. Statistics arrays are the API's sparse observations, not the replay collector's regular sampling grid; their last entry is not assumed to occur at match end. Fields absent from the upstream lake cannot be recovered by this collector.
 
 **Storage**
 
@@ -55,6 +106,15 @@ data/
     sources/               # Versioned reference definitions and selection records
   processed/               # Your study features, aggregates, and model outputs
     plots/                 # Created only when analysis.py is run
+  lake/                    # Separate collector: collect_lake.py
+    108313916/
+      match_player.parquet
+      match_salts.parquet
+      status.json.gz
+      requests.json.gz
+    tables/                # Source manifest and complete column schemas
+    last_run.json
+    run.log
 ```
 
 Each ZIP contains named Parquet tables compressed losslessly with Zstandard level 19. ZIP stores those already-compressed files without a second compression pass. Source JSON is gzip-compressed with its original bytes preserved; replay extracts use gzip NDJSON and demos retain their original downloaded compression. The loader handles bundles directly; no manual extraction or CSV duplicates are needed.
