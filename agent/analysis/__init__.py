@@ -1,1 +1,0 @@
-# Shared research analysis helpers.

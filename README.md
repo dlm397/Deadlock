@@ -1,221 +1,147 @@
-# Deadlock research dataset
+# Deadlock research, simplified
 
-Edit [main.py](main.py), run [collect.py](collect.py), and read saved tables through [dataset.py](dataset.py). Collection parses, normalizes, validates, and saves **one match at a time**, while prefetching the next compressed replay. Independent remote auditing runs alongside local replay work. A failed match is logged and skipped. [analysis.py](analysis.py) optionally creates five descriptive plots for one match.
+An independent implementation of replay collection, complete end-of-match lake collection, and player/team Markov analysis. It uses ordinary functions, processes one match at a time, and prints a failure before continuing to the next match. The original project is unchanged.
 
-**Setup and collection**
+## Project layout
 
-Requires Python 3.11+ and Node.js 18+ with npm on PATH. Run from the project directory. The existing virtual environment can be reused; a new installation on Windows uses:
+```text
+refactored/
+  main.py                  # Collection settings and entry point
+  README.md
+  requirements.txt         # Python dependencies
+  package.json             # Replay parser dependencies
+  package-lock.json
+  datapipe/
+    collect.py             # Detailed collection
+    lake.py                # End-of-match collection
+    sources.py             # API requests and reference definitions
+    replay.py, replay.mjs  # Replay decoding
+    normalize.py           # Research table construction
+    dataset.py             # Table readers, storage, and match counts
+  analysis/
+    markov.py              # Player/team model settings, forecasts, and plots
+    __main__.py            # python -m analysis
+```
+
+Dependency manifests and `.gitignore` remain at the project root. Python packages also contain `__init__.py`. Installed dependencies, generated analysis outputs, and temporary verification files use `node_modules/`, `data/`, and `validation/` respectively. Run the commands below from `refactored/`; collection can also be launched from elsewhere using the full path to `main.py`.
+
+## Setup and settings
+
+Requires Python 3.11+ and Node.js 18+ with npm. From this directory:
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe collect.py
+npm ci --ignore-scripts --no-audit --no-fund
+.\.venv\Scripts\python.exe main.py
 ```
 
-Node dependencies are installed automatically with `npm ci` when first needed. The replay bridge uses [deadem 4.0.1](https://github.com/Igor-Losev/deadem). On macOS/Linux use `python3` and `.venv/bin/python`. There are no command-line arguments; running `main.py` also starts collection.
+You can instead reuse the original environment with `..\.venv\Scripts\python.exe`. Node dependencies are installed locally; nothing imports the original implementation.
 
-| Setting in `main.py` | Behavior |
+Edit **main.py** for collection:
+
+| Setting | Meaning |
 |---|---|
-| `N_MATCHES` | Target number of additional successful matches under automatic selection; unavailable candidates can leave fewer. |
-| `MATCH_IDS` | Explicit list, such as `[107532139, 107532504]`; overrides the count and automatic selection filters. |
-| `SAMPLE_INTERVAL` | Replay sampling grid in game seconds; defaults to 10. |
-| `OUTPUT_DIR` | Dataset directory; defaults to `./data`. |
-| `REPROCESS` | Rebuild completed matches even when the code and relevant settings are unchanged. |
-| `OFFLINE` | Use archived metadata and replay extracts without downloading or parsing demos. |
-| `SAVE_RAW_DEMOS`, `SAVE_RAW_JSON` | Retain original sources; keep both `True` for reproducible future extraction. |
-| `PARSE_REPLAYS` | Parse replay state; keep `True` for the richer dataset. |
-| `QUERY_DEMO_API` | Optional independent replay kill-count check; public API limits can delay or prevent it. |
-| `PREFETCH` | Default `True`: prepare at most one next match while the current match is processed. `False` disables lookahead. |
-| `DOWNLOAD_WORKERS` | Default `4`: parallel byte-range streams for large replays when supported. Use `1` for one stream; maximum `8`. |
+| `OUTPUT_DIR` | `"../data"` uses existing data without copying it; `"./data"` creates a separate dataset. Paths are relative to this directory. |
+| `COLLECTION` | `"detailed"` downloads metadata and parses replays; `"lake"` collects all exposed match columns without demos. |
+| `N_MATCHES` | Additional successful matches to collect automatically. The candidate limit can leave fewer. |
+| `MATCH_IDS` | Explicit IDs, or `None` for automatic selection. Explicit IDs bypass selection filters. |
+| `SAMPLE_INTERVAL` | Replay grid in game seconds; default **20**. |
+| `SAVE_RAW_DEMOS`, `SAVE_RAW_JSON` | Retain downloaded demos and API JSON. Replay extracts and historical definitions remain available. |
+| `PARSE_REPLAYS` | Set `False`, together with `SAVE_RAW_DEMOS=False`, for metadata-only detailed collection. |
+| `REPROCESS` | Rebuild saved matches; otherwise completion markers control skipping. Changing code/settings does not trigger rebuilding automatically. |
+| `OFFLINE` | Detailed collection only: rebuild archived extracts without network access. Use with `REPROCESS=True`; changing the grid requires reparsing with `OFFLINE=False`. |
+| Filters | Duration/player count and Normal mode for detailed selection. Lake also supports mode, UTC date, and match-ID bounds. |
 
-Completed matches with the same code/settings fingerprint are skipped; automatic selection excludes them. Completion checks are cached within each run to avoid repeatedly hashing the same bundles. `REPROCESS=True` overrides skipping. Rebuilding one match replaces only its own bundles. Automatic selection queries the [public data lake](https://deadlock-api.com/data-dumps) for rows containing both metadata and replay salts plus a cluster ID; its hourly snapshot can lag the newest matches. Recent-match fallback checks replay availability before selecting a match. Normal, 12-player games lasting at least 15 minutes are required: this is a convenience sample, not a random population sample. Missing replays are skipped, and an exhausted candidate search reports how many requested matches were saved.
+`main.py` chooses the collector. `python -m datapipe.collect` can also run detailed collection directly. Normal automatic collection requires 12 players and at least 15 minutes. With offline collection and no explicit IDs, every archived match is considered regardless of `N_MATCHES`. Excluded matches print `SKIPPED` with the filter reasons. Network/parser failures print a short `FAILED` message, save details to the match's `sources/error.log` (lake: `error.log`), and continue. Full parser output stays in `sources/parser.log`. A temporary HTTP 503 is a server failure; rerun those IDs when the service recovers. Startup/selection failures stop cleanly with details in `tables/collection_error.log`.
 
-GET requests and interrupted replay downloads retry up to three times for temporary connection errors and HTTP 429/500/502/503/504 responses, with waits of 2, 4, and 60 seconds. `Retry-After` is respected; waits longer than 60 seconds defer that request to a later run. Failed matches are logged and collection continues. Missing replay URLs and eligibility-filter skips are expected; retries cannot create unavailable source data. POST job submissions are not automatically retried.
+Cached extracts must be complete and match the requested sampling interval. Incomplete extracts are reparsed online; completed matches still require `REPROCESS=True` to rebuild. Parser failures never replace previous successful extracts or count as completed matches.
 
-Both collectors accept the data lake's JSON and TOON SQL result formats. Read-only SQL queries also retry temporary HTTP failures, empty RPC responses, and the server's `NotReadyError` while its snapshot catalog loads. Malformed or truncated tables are rejected rather than treated as empty results; SQL errors retain the server's explanation. These retries do not resubmit replay audit jobs.
+## Read and analyze
 
-The speed settings keep all existing fields, schema audits, optional API query checks, source archives, and compression levels. Parallel downloads stream disjoint ranges to disk, verify response lengths and server validators, and fall back to one stream if needed. Each worker has its own HTTP session. Only one local parser and one match's normalized tables are active; completed work is saved before processing the next match. Successful API queries and compatible replay extracts are reused, and decoded reference definitions are cached for up to two versions per run. Stage timings are written to each match's status and replay status; `tables/last_run.json` includes elapsed time and speed settings. The `prefetch_download` timing records download/cache preparation before processing; the later `download` timing includes local checksum verification and can be very short because the replay is already cached. Logs distinguish cached reuse from network transfers. Timings can overlap and should not be summed as wall time.
+Export a downloaded, processed match's player states for inspection in Excel by editing the settings at the top of `export_match.py`, then running that file directly in VS Code:
 
-To apply cleaning changes locally, set `OFFLINE = True`, `REPROCESS = True`, then run `collect.py`. With `MATCH_IDS = None`, offline mode visits every archived match and ignores `N_MATCHES`. To change the sampling interval, use `OFFLINE = False` and select the affected match IDs so the demos can be reparsed. Set `OFFLINE` back to `False` when collecting new matches.
+```python
+MATCH_ID = 109521468
+TABLE = "player_state"  # Set "all" to export every saved table.
+DATA_DIR = OUTPUT_DIR  # Uses main.py's data directory.
+```
 
-**Lake collection without replays**
-
-Edit the settings at the top of [collect_lake.py](collect_lake.py), then run:
+Optional command-line overrides are also supported:
 
 ```powershell
-.\.venv\Scripts\python.exe collect_lake.py
+.\.venv\Scripts\python.exe export_match.py 109521468
+.\.venv\Scripts\python.exe export_match.py 109521468 --table all
 ```
 
-This separate collector writes to `data/lake` and leaves replay collection and `data/raw` alone. It downloads **every column** in the lake's `match_player` and `match_salts` tables: currently 151 and 5 columns. That includes final match/player results, item and upgrade histories, death details, objective records, statistics time series, tracked stats, rank fields, and every other exposed field. Source names and missing values are retained. The column list is discovered on each run, so new upstream columns are included automatically. Steam profile histories and leaderboard tables are not match records and are not collected.
+The first command writes `data/csv/109521468/player_state.csv`; `--table all` writes one CSV for each saved table in that folder. Use `--table events` or another table name to select a single table, and `--data-dir` to override `OUTPUT_DIR` from `main.py`. Existing exports are overwritten on rerun. Blank cells represent missing values; nested fields remain JSON text. This exports existing tables without downloading or parsing replays.
 
-| Setting in `collect_lake.py` | Behavior |
-|---|---|
-| `N_MATCHES` | Additional successful matches to save; completed matches and failures do not consume the target. |
-| `MATCH_IDS` | Explicit IDs; overrides the count and automatic selection filters. |
-| `GAME_MODE`, `MATCH_MODE` | Source enum names, e.g. `"Normal"`, `"StreetBrawl"`, `"Ranked"`; `None` removes the filter. |
-| `MIN_DURATION_S`, `EXPECTED_PLAYERS` | Defaults: at least 900 seconds and 12 distinct player slots. Use `0` and `None` to remove these restrictions. |
-| `START_DATE`, `END_DATE` | Match start-time interval, inclusive start and exclusive end. ISO dates/times; naive values are UTC. |
-| `MIN_MATCH_ID`, `MAX_MATCH_ID` | Inclusive ID bounds; discovery proceeds newest ID first. |
-| `REPROCESS` | Replace existing lake matches after successful retrieval; otherwise valid saved matches are skipped. |
-| `PAGE_SIZE`, `MAX_CANDIDATES` | Discovery query size and limit on new attempted matches. The automatic candidate limit defaults to `max(100, N_MATCHES * 10)`. |
-| `REQUEST_DELAY` | Optional minimum interval between SQL queries, in seconds. HTTP retries retain the existing backoff policy. |
-| `OUTPUT_DIR`, `COMPRESSION_LEVEL` | Default `./data/lake`, with lossless Zstandard level 19. |
-
-Each match has `<match_id>/match_player.parquet`, `match_salts.parquet`, and `status.json.gz`. The status records all source schemas, column encodings, checksums, row counts, and provenance; request logs are compressed alongside them. `tables/` holds the observed manifest and schemas; `last_run.json` summarizes the run. Both tables are staged before replacing an existing saved match. Failures are recorded and the next match is attempted.
-
-The SQL service caps response size. Full records are transferred in bounded chunks with checksums, byte-length checks, column checks, and source-inventory checks. The collector holds only one match at a time and retains **all source versions and exact duplicate rows**. Those rows must not be treated as independent players in statistical models. The live lake updates periodically; the observed manifest is archived for context, but the MCP queries are not pinned to that manifest. A table that changes during retrieval is rejected for a later retry.
+Run Python from this directory so imports select the new reader:
 
 ```python
-import json
-from dataset import lake_match_ids, read_lake_match, iter_lake_matches
-
-mid = lake_match_ids()[0]
-players = read_lake_match(mid)  # Every stored version; nested values are JSON strings.
-distinct_records = players.drop_duplicates()
-economy = read_lake_match(mid, columns=["match_id", "player_slot", "net_worth", "created_at"])
-history = json.loads(players.iloc[0]["stats.net_worth"])
-times = json.loads(players.iloc[0]["stats.time_stamp_s"])
-
-for mid, players in iter_lake_matches():
-    # Construct study features one match at a time.
-    pass
-```
-
-Lake reader `output_dir` is the parent dataset directory (`./data`), consistent with the existing readers. For a custom location, keep the `lake` subdirectory, e.g. collect to `./study/lake` and read with `output_dir="./study"`. Enums retain their source names (`"Team0"`, `"Normal"`); timestamps retain their source text; integer IDs retain exact nullable integer types. Inspect `created_at` when deciding which source revision to analyze after removing exact duplicates. Statistics arrays are the API's sparse observations, not the replay collector's regular sampling grid; their last entry is not assumed to occur at match end. Fields absent from the upstream lake cannot be recovered by this collector.
-
-**Storage**
-
-```text
-data/
-  raw/
-    107532139/
-      summaries.zip
-      states.zip
-      purchases.zip
-      events.zip
-      sources/             # Downloads, replay extracts, provenance, audits, status
-    107532504/
-      ...
-  tables/
-    heroes.parquet
-    items.parquet
-    abilities.parquet
-    catalog.json           # Match status, versions, and row counts
-    last_run.json
-    run.log
-    sources/               # Versioned reference definitions and selection records
-  processed/               # Your study features, aggregates, and model outputs
-    plots/                 # Created only when analysis.py is run
-  lake/                    # Separate collector: collect_lake.py
-    108313916/
-      match_player.parquet
-      match_salts.parquet
-      status.json.gz
-      requests.json.gz
-    tables/                # Source manifest and complete column schemas
-    last_run.json
-    run.log
-```
-
-Each ZIP contains named Parquet tables compressed losslessly with Zstandard level 19. ZIP stores those already-compressed files without a second compression pass. Source JSON is gzip-compressed with its original bytes preserved; replay extracts use gzip NDJSON and demos retain their original downloaded compression. The loader handles bundles directly; no manual extraction or CSV duplicates are needed.
-
-| Bundle | Tables |
-|---|---|
-| `summaries.zip` | `matches`, `players`, `game_versions`, `metadata_teams`, `metadata_damage`, `metadata_custom_stats`, `metadata_gold_sources` |
-| `states.zip` | `player_state`, `team_state`, `metadata_player_stats`, `metadata_player_paths` |
-| `purchases.zip` | `purchases`, `metadata_item_records` |
-| `events.zip` | `events`, `metadata_objectives`, `metadata_midboss`, `legacy_events`, `replay_event_counts` |
-
-A manifest is also included in `summaries.zip`. Detailed per-match warnings and field coverage are in `sources/status.json.gz`; failures appear in `sources/last_error.json.gz`.
-
-**Reading data and building model inputs**
-
-```python
-from dataset import match_ids, read_match, read_reference
+from datapipe.dataset import match_ids, read_match, read_reference, iter_matches
 
 mid = match_ids()[0]
-states = read_match(mid, "player_state", columns=[
-    "player_id", "game_time", "net_worth", "unspent_souls",
-    "spirit_power", "spirit_power_source_game_time", "spirit_power_state_age",
-])
-heroes = read_reference("heroes", version=6698)
+states = read_match(mid, "player_state")
+version = read_match(mid, "matches").iloc[0].game_version
+heroes = read_reference("heroes", version=version)
+for mid, teams in iter_matches("team_state"):
+    pass  # Build a small feature record, then release this match's frame.
+
+lake_ids = match_ids(lake=True)
+players = read_match(lake_ids[0], "match_player")
 ```
 
-Reference tables keep multiple `definitions_version` values; join item/hero IDs using the match's version. IDs remain exact and readers use nullable pandas dtypes; do not convert IDs to floating point or replace missing IDs with zero. Nested dictionaries and arrays are JSON strings: decode a nonmissing value with `json.loads(value)` when needed.
+All reader functions accept `output_dir`. `python -m datapipe.dataset` prints detailed and end-of-match counts. Lake tables retain duplicate rows and multiple source versions; inspect `created_at` and remove exact duplicates deliberately for modeling. Nested arrays/maps are JSON strings, decoded with `json.loads`.
 
-For modeling, iterate through matches and retain only small feature records. This example produces one observation per match using team 0's advantage at ten minutes:
+Edit **analysis/markov.py** and run `python -m analysis` for the player or team Markov model (`LEVEL`). It follows the data directory from main.py and writes to `refactored/data/processed/markov_player_souls/` or `markov_team_souls/`; change `RESULTS_DIR` to choose another destination. Settings include state count, game-time bins, sampling interval, prediction horizons, and held-out fraction. `describe_match()` produces the five descriptive views in two figures. Use the module commands above to run files inside the packages, so Python resolves their imports from the project root.
 
 ```python
-from pathlib import Path
-import pandas as pd
-from main import OUTPUT_DIR
-from dataset import iter_matches, read_match
-
-features = []
-for mid, teams in iter_matches("team_state", columns=[
-    "game_time", "team", "net_worth_advantage", "economy_complete",
-]):
-    at_ten = teams.loc[(teams["game_time"] == 600) & (teams["team"] == 0)]
-    if len(at_ten) != 1 or not at_ten.iloc[0]["economy_complete"]:
-        continue
-    advantage = at_ten.iloc[0]["net_worth_advantage"]
-    if pd.isna(advantage):
-        continue
-    match = read_match(mid, "matches", columns=["winning_team", "game_version"]).iloc[0]
-    features.append({"match_id": mid, "advantage_600": advantage,
-                     "team0_win": int(match["winning_team"] == 0),
-                     "game_version": match["game_version"]})
-
-output = Path(OUTPUT_DIR) / "processed"
-output.mkdir(parents=True, exist_ok=True)
-pd.DataFrame(features).to_parquet(output / "win_features.parquet", index=False, compression="zstd")
+from analysis import run, predict_state_distribution, describe_match
+model = run(level="team")
+forecast = predict_state_distribution("Behind", 12 * 60, 5 * 60, model)
+describe_match(mid)
 ```
 
-Memory grows with one match plus your retained features, rather than all replay rows. Individual unusually large matches can still exceed available resources and fail. Split model evaluation by match, avoid future information in predictors, and account for repeated observations. The initial five matches support workflow development, not reliable statistical inference.
+Markov outputs include compressed modeling/transition tables, empirical matrices and counts by horizon/stage, held-out predictions and scores, figures, model parameters, and summary.txt. Whole matches are held out **before** estimating boundaries and forecast parameters. Descriptive matrices use all matches; predictive matrices use training matches only. Longer transitions require uninterrupted observations.
 
-**Markov analysis of relative net worth**
+## Storage and measurements
 
-Edit the settings at the top of [markov_souls.py](markov_souls.py), then run:
-
-```powershell
-.\.venv\Scripts\python.exe markov_souls.py
+```text
+OUTPUT_DIR/
+  raw/<match_id>/
+    summaries.zip          # Matches, players, versions, teams, damage, custom/gold stats
+    states.zip             # Player/team panels and native metadata stats/paths
+    purchases.zip          # Transactions and original item records
+    events.zip             # Events, objectives, Midboss, legacy events, event counts
+    sources/               # Compressed metadata, replay extracts, demo, completion record
+  tables/                  # Historical heroes/items/abilities and their source definitions
+  lake/<match_id>/         # match_player.parquet, match_salts.parquet, status.json.gz
+  lake/tables/             # Source schemas and observed manifest
 ```
 
-The script reads existing matches through `dataset.py`, constructs relative net worth and within-match ranks, and estimates overall and game-stage transition matrices. It uses a common sampling interval without interpolation (20 seconds for the current mix of 10- and 20-second data). State boundaries and prediction parameters use training matches only; complete matches are held out for validation. Collection and raw data are unchanged.
+The detailed bundles retain all **18 table names**, using Zstandard level 19 inside uncompressed ZIP containers. Lake Parquet uses the same compression. JSON/extracts use gzip; downloaded demos retain their original compression. IDs remain exact nullable integers. The existing dataset.py can read the new detailed bundles; this reader can read both versions.
 
-Results, compressed modeling tables, and figures are saved under [data/processed/markov_souls](data/processed/markov_souls/). Start with [summary.txt](data/processed/markov_souls/summary.txt). After running the script, forecast from a state using seconds:
+Use `net_worth`, `unspent_souls`, and `spent_souls`; the ambiguous `souls` placeholder stays null. Spirit power is metadata's `tech_power`, typically observed much less often than the replay grid. Keep its source-time and age columns. Metadata is carried forward only from the past, and the latest sparse snapshot is not silently treated as a final scoreboard.
 
-```python
-from markov_souls import predict_state_distribution
+Team totals require complete observations. Positions are derived from replay cells or quantized metadata paths, with quality/provenance labels. A removed item is not necessarily a sale; purchase balances are earlier sampled balances. Rejuvenator claim teams can be known while claim times remain missing. Definitions are joined by the replay's exact client version; current assets never substitute for unavailable historical definitions.
 
-forecast = predict_state_distribution("Behind", 12 * 60, 5 * 60)
-print(forecast)
-```
+Collection is a convenience sample. Repeated players, opposing teams, and overlapping transitions are dependent. Forecasts assume the match continues; expected wealth is a state-mean proxy. Three matches validate implementation agreement, not predictive usefulness or the Markov assumption.
 
-Forecast horizons must be multiples of the fitted sampling interval. The returned relative-net-worth value is a probability-weighted state-mean proxy. Evaluation is exploratory: repeated players and overlapping transitions are dependent, and forecasts assume the match continues.
+## Differences and verification
 
-For the same analysis at team level, edit [markov_team_souls.py](markov_team_souls.py) and run:
+Removed API wrapper classes, prefetch/parallel-range machinery, retry/backoff orchestration, code fingerprints, catalog/checkpoint management, exhaustive schema/coverage audits, migrations, and the broad test suite. Independent remote demo SQL kill-count auditing was removed because it duplicates local event information and can stall on service failures. No per-read checksum scan is performed; bundle CRC and Parquet decoding still apply, and saved hashes remain available.
 
-```powershell
-.\.venv\Scripts\python.exe markov_team_souls.py
-```
+Player and team modeling share one preparation/estimation path; team wealth is summed from the same fresh player observations. The persistence and overall/stage model comparisons remain; the training-marginal baseline and duplicate report files were removed. Detailed state rows are ordered by player slot and time. `field_provenance` is smaller, metadata carry-forward quality is named `metadata_asof`, and explicit `net_worth_source_game_time` improves purchase/team freshness when a replay field is unavailable. Remote-audit-only columns are absent. Core economic/event measurements are unchanged.
 
-This reads `team_state` through `dataset.py` and requires both teams' complete, fresh replay observations. `relative_net_worth` is the team total minus the mean of the two team totals; `net_worth_advantage` is the full lead over the opponent, twice that relative value. Both teams remain in the same training or test split: their opposite relative trajectories are dependent observations of the same match.
+Compared original and new normalization on **107673695, 108313916, 104533570** (versions 6698, 6701, 6686): all table row counts and substantive winners, rosters, K/D/A, economic states, purchases and event counts agreed. Saved-table comparisons passed, including reading the new bundles with the original reader. A fresh new-parser run on 108313916 produced identical decompressed player-state, event, and entity extracts. Both original Markov scripts were run on these matches; observations, states, matrices, forecasts and held-out scores agreed with the new models.
 
-Outputs mirror the player analysis under [data/processed/markov_team_souls](data/processed/markov_team_souls/): compressed modeling tables, overall and time-bin matrices, validation scores, forecasts, figures, and [summary.txt](data/processed/markov_team_souls/summary.txt). Team forecasts also return `expected_net_worth_advantage`, a state-mean estimate of the future lead:
+Two local lake matches round-tripped all fields, exact integer/null types and duplicate multiplicities. A live fetch exposed **157** player columns, adding six fields to the archived 151-column schema. Its records matched the archived values; the service currently returns 12 rather than the archived 24 records for 108313916. The collector retains what the source actually returns. Integrity checks cover temporal gaps, match-separated validation, source alignment, historical definitions, null/exact IDs, and continuing after a match failure.
 
-```python
-from markov_team_souls import predict_state_distribution
+The necessary complexity remains in replay clock/player alignment, measurement normalization, and chunked lake retrieval: the public SQL endpoint limits response size, so records are chunked and checked to prevent silent truncation. Deadem/engine are pinned to 4.0.1 with a small adapter for the replay-declared `fixed8` encoding, `CUtlBinaryBlock`, and `CGlobalSymbol`. Binary blocks remain lossless byte arrays. These newer encodings caused the October 1 missing-entity errors; the adapter fixes decoding without ignoring entities or fabricating state. Decoder extensions are recorded in the replay summary and `game_versions`.
 
-forecast = predict_state_distribution("Behind", 12 * 60, 5 * 60)
-```
+After the decoder fix, all three reported failures (109509684, 109507240, 109510742; version 6730) parsed and saved successfully. Their 924, 1,356, and 1,968 player-state rows passed roster, source-time, team-total, and fresh net-worth checks. Replay hero-kill counts matched metadata deaths (70, 83, 135). The older 108313916 replay still produced byte-identical decoded extracts. Separate failure-path checks verified concise messages, continued collection, and preservation of previous successful extracts.
 
-Both scripts share their estimation, validation, and plotting code under `agent/analysis/`; settings and data preparation remain in the scripts.
+At the initial simplification, source/configuration files decreased from 42 to 14 and Python/JS from 6,655 lines (4,007 excluding tests) to 1,740. Dependencies remain the same research stack; NumPy and the parser engine, previously transitive, are now explicit. Counts exclude installed dependencies and generated data.
 
-**Measurement coverage**
-
-`spirit_power` was missing because the source calls it `tech_power`. Both names are now retained. Spirit and weapon power come from sparse metadata snapshots, typically every 180 seconds; their dedicated source-time and age columns distinguish them from the finer replay grid. Values before the first observation remain missing. Existing extracts also now expose unspent/spent souls, available ability points, unlock tokens, denies, last hits, kill streak, and disconnect state.
-
-Exact transaction balances, verified 3D velocity, interpreted ability levels, and some objective timelines remain unavailable. The ambiguous `souls` placeholder remains null; use the explicit `net_worth`, `unspent_souls`, and `spent_souls` measures. Missing values are not zeros. Item removal does not establish a sale, and overlapping metadata/replay events require source-aware counting. See [field coverage and evidence](data/tables/field_coverage.json) for the measured sample coverage and limitations.
-
-Collection internals, parser dependencies, tests, and research notes live under `agent/`; normal collection and analysis do not require opening them. Change source interpretation there only when developing the collector. Keep study-specific restrictions and derived features in your own scripts and `data/processed/`.
+Temporary verification outputs remain in `validation/` because automatic approval review blocked cleanup. They are ignored by Git, unused by the implementation, and can be removed manually. Existing datasets were accessed in place; the temporary outputs were generated for comparison. The initial verification confirmed all 42 original tracked file hashes and the paths, sizes and modification times of all 10,882 existing data files were unchanged.

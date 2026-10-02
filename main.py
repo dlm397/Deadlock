@@ -1,17 +1,38 @@
-# User settings. Run collect.py after editing.
-N_MATCHES = 200 # 3 minutes per match
-SAMPLE_INTERVAL = 20  # game seconds between replay observations
+from pathlib import Path
+
+# Collection settings. Relative paths are anchored to this file.
 OUTPUT_DIR = "./data"
-MATCH_IDS = None  # e.g. [107544778, 107535709]; overrides N_MATCHES
+N_MATCHES = 1
+MATCH_IDS = None  # Explicit IDs override automatic selection filters.
+SAMPLE_INTERVAL = 20
 SAVE_RAW_DEMOS = True
 SAVE_RAW_JSON = True
 PARSE_REPLAYS = True
-QUERY_DEMO_API = True  # Optional independent kill-count check; API rate limits apply.
-REPROCESS = False  # Rebuild completed matches even when code/settings are unchanged.
-OFFLINE = False  # Rebuild local extracts without downloading or parsing demos.
-PREFETCH = True  # Download the next match while processing the current one.
-DOWNLOAD_WORKERS = 4  # Parallel replay ranges when supported; 1 uses one stream.
+REPROCESS = False
+OFFLINE = False  # Rebuild from archived metadata and replay extracts.
+COLLECTION = "detailed"  # "detailed" or "lake"
+
+# Automatic selection; explicit MATCH_IDS bypass these filters.
+MIN_DURATION_S = 900
+EXPECTED_PLAYERS = 12
+GAME_MODE = "Normal"
+MATCH_MODE = None  # Lake collection only.
+START_DATE = None  # UTC, inclusive; lake collection only.
+END_DATE = None  # UTC, exclusive.
+MIN_MATCH_ID = None
+MAX_MATCH_ID = None
+
+OUTPUT_DIR = (Path(__file__).resolve().parent / OUTPUT_DIR).resolve()
 
 if __name__ == "__main__":
-    from collect import main
-    main()
+    import main as settings
+    if COLLECTION == "lake":
+        from datapipe.lake import run
+    else:
+        from datapipe.collect import run
+    from datapipe.sources import report_error
+    try:
+        run(settings)
+    except Exception as error:
+        report_error(error, OUTPUT_DIR / "tables/collection_error.log", "Collection stopped")
+        raise SystemExit(1) from None

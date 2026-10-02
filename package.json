@@ -1,0 +1,12 @@
+{
+  "name": "deadlock-research-small",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@deademx/engine": "4.0.1",
+    "deadem": "4.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
