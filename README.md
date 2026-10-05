@@ -1,147 +1,152 @@
-# Deadlock research, simplified
+# Deadlock
 
-An independent implementation of replay collection, complete end-of-match lake collection, and player/team Markov analysis. It uses ordinary functions, processes one match at a time, and prints a failure before continuing to the next match. The original project is unchanged.
+summary-placeholder
 
 ## Project layout
 
 ```text
-refactored/
-  main.py                  # Collection settings and entry point
+Deadlock2/
+  pipeline.py          # command to run the pipeline
+  config.toml          # settings to edit
   README.md
-  requirements.txt         # Python dependencies
-  package.json             # Replay parser dependencies
-  package-lock.json
-  datapipe/
-    collect.py             # Detailed collection
-    lake.py                # End-of-match collection
-    sources.py             # API requests and reference definitions
-    replay.py, replay.mjs  # Replay decoding
-    normalize.py           # Research table construction
-    dataset.py             # Table readers, storage, and match counts
-  analysis/
-    markov.py              # Player/team model settings, forecasts, and plots
-    __main__.py            # python -m analysis
+  app/                 # Python code, replay parser, dependencies
+  other/               # legacy importer and CSV cleanup utility
+  data/                # research outputs and retained replays
+  .venv/               # Python environment
+  .validation/         # local verification artifacts and code backups
 ```
 
-Dependency manifests and `.gitignore` remain at the project root. Python packages also contain `__init__.py`. Installed dependencies, generated analysis outputs, and temporary verification files use `node_modules/`, `data/`, and `validation/` respectively. Run the commands below from `refactored/`; collection can also be launched from elsewhere using the full path to `main.py`.
+The implementation is in `app/pipeline.py`; the top level `pipeline.py` is a launcher.
 
-## Setup and settings
+## Install and run
 
-Requires Python 3.11+ and Node.js 18+ with npm. From this directory:
+Uses Python 3.11+ and Node.js 18+. Edit `config.toml` for settings. For desired match ID's, set `match_ids = [123456, 234567]`, or set `match_ids_file` to a text file of IDs. Empty IDs and file enable discovery through the Deadlock API's public SQL/MCP endpoint. Discovery selects newest match IDs with recorded replay salts, metadata salts, and replay server identifiers. Every candidate, including an explicitly supplied ID, must pass the same eligibility check using its full individual match metadata.
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-npm ci --ignore-scripts --no-audit --no-fund
-.\.venv\Scripts\python.exe main.py
+# Discovers and downloads match, using settings in comfig.toml
+python pipeline.py collect
+# Downloads the given match ID's
+python pipeline.py collect --match-ids 123456 234567
+# Downlods all the match ID's in matches.txt, --csv enables option for optional csv.
+python pipeline.py collect --match-file matches.txt --csv 
+# Rebuild outputs from retained reply files, using config.toml interval
+python pipeline.py reprocess
+# Rebuilds, overrides interval timing from config.toml with --interval flag
+python pipeline.py reprocess --interval 60
+# Retries matches recorded in the failure log, can be set for match ID's, same as collect
+python pipeline.py retry
 ```
 
-You can instead reuse the original environment with `..\.venv\Scripts\python.exe`. Node dependencies are installed locally; nothing imports the original implementation.
+All commands accept `--config path/to/config.toml`, `--match-ids`, `--match-file`, `--interval`, `--retry-failures`, `--rebuild`, and `--csv`. With no command, collection is the default.
 
-Edit **main.py** for collection:
+Progress, warnings, errors, and summary messages include timestamps.
 
-| Setting | Meaning |
-|---|---|
-| `OUTPUT_DIR` | `"../data"` uses existing data without copying it; `"./data"` creates a separate dataset. Paths are relative to this directory. |
-| `COLLECTION` | `"detailed"` downloads metadata and parses replays; `"lake"` collects all exposed match columns without demos. |
-| `N_MATCHES` | Additional successful matches to collect automatically. The candidate limit can leave fewer. |
-| `MATCH_IDS` | Explicit IDs, or `None` for automatic selection. Explicit IDs bypass selection filters. |
-| `SAMPLE_INTERVAL` | Replay grid in game seconds; default **20**. |
-| `SAVE_RAW_DEMOS`, `SAVE_RAW_JSON` | Retain downloaded demos and API JSON. Replay extracts and historical definitions remain available. |
-| `PARSE_REPLAYS` | Set `False`, together with `SAVE_RAW_DEMOS=False`, for metadata-only detailed collection. |
-| `REPROCESS` | Rebuild saved matches; otherwise completion markers control skipping. Changing code/settings does not trigger rebuilding automatically. |
-| `OFFLINE` | Detailed collection only: rebuild archived extracts without network access. Use with `REPROCESS=True`; changing the grid requires reparsing with `OFFLINE=False`. |
-| Filters | Duration/player count and Normal mode for detailed selection. Lake also supports mode, UTC date, and match-ID bounds. |
+`reprocess` uses selected retained replay files, or all retained replays when no IDs are selected. It can fetch small metadata and versioned definitions again, but does not download the replay again. `retry` explicitly retries active failures; absent an explicit/configured selection, it uses the failure log. Ordinary collection and reprocessing skip failures unless `--retry-failures` is set. Collection skips complete outputs at the requested interval. Use `--rebuild` when changing extracted variables without changing the interval.
 
-`main.py` chooses the collector. `python -m datapipe.collect` can also run detailed collection directly. Normal automatic collection requires 12 players and at least 15 minutes. With offline collection and no explicit IDs, every archived match is considered regardless of `N_MATCHES`. Excluded matches print `SKIPPED` with the filter reasons. Network/parser failures print a short `FAILED` message, save details to the match's `sources/error.log` (lake: `error.log`), and continue. Full parser output stays in `sources/parser.log`. A temporary HTTP 503 is a server failure; rerun those IDs when the service recovers. Startup/selection failures stop cleanly with details in `tables/collection_error.log`.
+## Configuration
 
-Cached extracts must be complete and match the requested sampling interval. Incomplete extracts are reparsed online; completed matches still require `REPROCESS=True` to rebuild. Parser failures never replace previous successful extracts or count as completed matches.
+Paths are relative to the configuration file. Main settings:
 
-## Read and analyze
+| Setting | Default / purpose |
+| --- | --- |
+| `match_ids`, `match_ids_file` | Explicit IDs or an input file; empty enables discovery |
+| `sampling_interval_s` | Defaults to `20`; time slicing of event stream in seconds |
+| `output_dir` | Defaults to `data` |
+| `retain_replays` | Defaults to `true`; false removes a replay only after successful output writes |
+| `export_csv` | Defaults to `false`; optional CSV alongside each Parquet, for visual inspection |
+| `retry_failures` | Defaults to `false`; allow attempts listed in the failure log |
+| `rebuild_outputs` | Defaults to `false`; rebuild existing outputs |
+| `discovery_count`,  | Number of matches to retreive with full data|
+| `discovery_limit` | Number of allow match's to request for full data for exiting |
+| `api_base` | API location; If future data sources want to be implemented |
+| `disable_steam` | `false` permits Steam fallback, `true` disables it |
 
-Export a downloaded, processed match's player states for inspection in Excel by editing the settings at the top of `export_match.py`, then running that file directly in VS Code:
+Changing `sampling_interval_s` rebuilds time slices from the retained replay on the next run. Files for that match are replaced, so use a different `output_dir` to keep multiple sampling resolutions.
 
-```python
-MATCH_ID = 109521468
-TABLE = "player_state"  # Set "all" to export every saved table.
-DATA_DIR = OUTPUT_DIR  # Uses main.py's data directory.
-```
+Discovery pages through `match_salts` via `/v1/mcp`, excluding active failures unless retries are enabled, known ineligible matches unless retries/rebuilding are enabled, and complete outputs already at the requested interval unless rebuilding. These exclusions do not consume `discovery_limit`. Eligibility rejections and download/parse failures among the selected candidates do consume it. `discovery_count = 1` and `discovery_limit = 30` therefore stop after one successful collection or exhaustion of 30 candidates. Explicit IDs, `retry`, and `reprocess` do not use this discovery limit.
 
-Optional command-line overrides are also supported:
+Recorded salts identify a replay URL but do not guarantee that Valve still serves the file. A failed discovery query stops collection with an error; it does not fall back to metadata-only recent matches. `disable_steam = false` does not force the API to refresh an existing record with a missing replay salt. Prior failed IDs still require `retry` or `--retry-failures` to be attempted again.
 
-```powershell
-.\.venv\Scripts\python.exe export_match.py 109521468
-.\.venv\Scripts\python.exe export_match.py 109521468 --table all
-```
-
-The first command writes `data/csv/109521468/player_state.csv`; `--table all` writes one CSV for each saved table in that folder. Use `--table events` or another table name to select a single table, and `--data-dir` to override `OUTPUT_DIR` from `main.py`. Existing exports are overwritten on rerun. Blank cells represent missing values; nested fields remain JSON text. This exports existing tables without downloading or parsing replays.
-
-Run Python from this directory so imports select the new reader:
-
-```python
-from datapipe.dataset import match_ids, read_match, read_reference, iter_matches
-
-mid = match_ids()[0]
-states = read_match(mid, "player_state")
-version = read_match(mid, "matches").iloc[0].game_version
-heroes = read_reference("heroes", version=version)
-for mid, teams in iter_matches("team_state"):
-    pass  # Build a small feature record, then release this match's frame.
-
-lake_ids = match_ids(lake=True)
-players = read_match(lake_ids[0], "match_player")
-```
-
-All reader functions accept `output_dir`. `python -m datapipe.dataset` prints detailed and end-of-match counts. Lake tables retain duplicate rows and multiple source versions; inspect `created_at` and remove exact duplicates deliberately for modeling. Nested arrays/maps are JSON strings, decoded with `json.loads`.
-
-Edit **analysis/markov.py** and run `python -m analysis` for the player or team Markov model (`LEVEL`). It follows the data directory from main.py and writes to `refactored/data/processed/markov_player_souls/` or `markov_team_souls/`; change `RESULTS_DIR` to choose another destination. Settings include state count, game-time bins, sampling interval, prediction horizons, and held-out fraction. `describe_match()` produces the five descriptive views in two figures. Use the module commands above to run files inside the packages, so Python resolves their imports from the project root.
-
-```python
-from analysis import run, predict_state_distribution, describe_match
-model = run(level="team")
-forecast = predict_state_distribution("Behind", 12 * 60, 5 * 60, model)
-describe_match(mid)
-```
-
-Markov outputs include compressed modeling/transition tables, empirical matrices and counts by horizon/stage, held-out predictions and scores, figures, model parameters, and summary.txt. Whole matches are held out **before** estimating boundaries and forecast parameters. Descriptive matrices use all matches; predictive matrices use training matches only. Longer transitions require uninterrupted observations.
-
-## Storage and measurements
+## Outputs and schemas
 
 ```text
-OUTPUT_DIR/
-  raw/<match_id>/
-    summaries.zip          # Matches, players, versions, teams, damage, custom/gold stats
-    states.zip             # Player/team panels and native metadata stats/paths
-    purchases.zip          # Transactions and original item records
-    events.zip             # Events, objectives, Midboss, legacy events, event counts
-    sources/               # Compressed metadata, replay extracts, demo, completion record
-  tables/                  # Historical heroes/items/abilities and their source definitions
-  lake/<match_id>/         # match_player.parquet, match_salts.parquet, status.json.gz
-  lake/tables/             # Source schemas and observed manifest
+data/
+  matches/<match_id>.parquet          # End of match data common across players
+  end_match/<match_id>.parquet        # End of match player data
+  time_slices/<match_id>.parquet      # Player data by time slice
+  events/<match_id>.parquet           # Processed event stream
+  replays/<match_id>.dem.bz2          # or .dem.zst / .dem, according to content, raw retrieved files
+  version/<client_version>_item.csv   # Lookup table for item ID's by version
+  version/<client_version>_event.csv  # Look up table for event ID's by version
+  collection_status.csv               # List of status of collected matches
+  failures.csv                        # List of match ID's which failed
 ```
 
-The detailed bundles retain all **18 table names**, using Zstandard level 19 inside uncompressed ZIP containers. Lake Parquet uses the same compression. JSON/extracts use gzip; downloaded demos retain their original compression. IDs remain exact nullable integers. The existing dataset.py can read the new detailed bundles; this reader can read both versions.
+Tables contain scalar, typed columns. Identifiers remain exact integers; calendar datetimes use UTC; game times use seconds. Missing, unavailable, and unverified values are null, never a fabricated zero. A recorded zero remains zero, except documented unknown sentinels such as an unassigned rank badge. Join `matches` to the other tables on `match_id`, and player records on `(match_id, player_slot)`; `account_id` is optional. Canonical teams are metadata teams `0` and `1`. Output modes/outcomes use readable enum names; eligibility checks use their verified protocol meanings. `export_csv = true` writes a CSV alongside each Parquet file.
 
-Use `net_worth`, `unspent_souls`, and `spent_souls`; the ambiguous `souls` placeholder stays null. Spirit power is metadata's `tech_power`, typically observed much less often than the replay grid. Keep its source-time and age columns. Metadata is carried forward only from the past, and the latest sparse snapshot is not silently treated as a final scoreboard.
+The column definitions and source mappings are kept near the top of `app/normalize.py` and `app/replay.mjs`; these are the small sections to edit when changing variables.
 
-Team totals require complete observations. Positions are derived from replay cells or quantized metadata paths, with quality/provenance labels. A removed item is not necessarily a sale; purchase balances are earlier sampled balances. Rejuvenator claim teams can be known while claim times remain missing. Definitions are joined by the replay's exact client version; current assets never substitute for unavailable historical definitions.
+| Table | Row key | Contents |
+| --- | --- | --- |
+| `matches` | `match_id` | One row per match: start, duration, player count, modes, match outcome, winning team, map, and distinct software/build identifiers |
+| `end_match` | `match_id, player_slot` | Identity/team; player win outcome; rank/lane; K/D/A, net worth, level, last hits, denies; final combat statistics where proven final |
+| `time_slices` | `match_id, player_slot, game_time_s` | Replay-observed counters, net worth and unspent souls, health/alive state and XYZ position; actual observation time and final-observation flag |
+| `events` | `match_id, event_id` plus participant | Deaths/kills/assists, item changes, ability progression, objectives, midboss/rejuvenator information where supported |
 
-Collection is a convenience sample. Repeated players, opposing teams, and overlapping transitions are dependent. Forecasts assume the match continues; expected wealth is a state-mean proxy. Three matches validate implementation agreement, not predictive usefulness or the Markov assumption.
+Explicit metadata final counters take priority. Combat values come from one metadata snapshot whose integer `time_stamp_s` equals `duration_s`. `combat_stats_time_s` is that timestamp and `combat_stats_at_end` reports whether that snapshot exists. If it does not exist, the combat values/time are null and the flag is false. Individual absent fields remain null even when the flag is true. There is no fallback to an earlier snapshot, so these fields share one observation time. Sparse metadata snapshots are not inserted into the replay timeline.
 
-## Differences and verification
+`net_worth` and `unspent_souls` are different variables. Replay `hero_damage_taken` remains null where no verified cumulative replay field is available. Position units are Source 2 world units, not meters. A client version, replay build number, replay patch version, and game-mode version remain separate; no unverified readable balance-patch label is assigned. `hero_build_id` is a player's selected build guide, not a software version, and is not exported.
 
-Removed API wrapper classes, prefetch/parallel-range machinery, retry/backoff orchestration, code fingerprints, catalog/checkpoint management, exhaustive schema/coverage audits, migrations, and the broad test suite. Independent remote demo SQL kill-count auditing was removed because it duplicates local event information and can stall on service failures. No per-read checksum scan is performed; bundle CRC and Parquet decoding still apply, and saved hashes remain available.
+## Version definitions
 
-Player and team modeling share one preparation/estimation path; team wealth is summed from the same fresh player observations. The persistence and overall/stage model comparisons remain; the training-marginal baseline and duplicate report files were removed. Detailed state rows are ordered by player slot and time. `field_provenance` is smaller, metadata carry-forward quality is named `metadata_asof`, and explicit `net_worth_source_game_time` improves purchase/team freshness when a replay field is unavailable. Remote-audit-only columns are absent. Core economic/event measurements are unchanged.
+`data/version/` (or `version/` inside your configured `output_dir`) contains `<client_version>_item.csv` and `<client_version>_event.csv`. These are always CSV, independently of `export_csv`. Collection writes definitions for each known replay client version, and `migrate` also fills them for versions already present in `matches`. A metadata-only match can have an unknown client version; no version is guessed for it.
 
-Compared original and new normalization on **107673695, 108313916, 104533570** (versions 6698, 6701, 6686): all table row counts and substantive winners, rosters, K/D/A, economic states, purchases and event counts agreed. Saved-table comparisons passed, including reading the new bundles with the original reader. A fresh new-parser run on 108313916 produced identical decompressed player-state, event, and entity extracts. Both original Markov scripts were run on these matches; observations, states, matrices, forecasts and held-out scores agreed with the new models.
+The item file has `client_version, item_id, name, class_name, type, item_slot_type, item_tier, cost`. It contains the exact-version API asset catalog, including abilities and weapon definitions as well as shop items. Join an event's `item_id`, `ability_id`, or `imbued_ability_id` to this file's `item_id`, using `matches.client_version` to choose the file. Names may be internal labels where the source has no friendly name. Missing shop fields stay blank, and catalog `cost` is a definition price rather than an observed payment. Unknown asset IDs should remain unmatched.
 
-Two local lake matches round-tripped all fields, exact integer/null types and duplicate multiplicities. A live fetch exposed **157** player columns, adding six fields to the archived 151-column schema. Its records matched the archived values; the service currently returns 12 rather than the archived 24 records for 108313916. The collector retains what the source actually returns. Integrity checks cover temporal gaps, match-separated validation, source alignment, historical definitions, null/exact IDs, and continuing after a match failure.
+The event file has `client_version, event_type, event_name, description, participant_roles, notes`. It documents all event types supported by this pipeline and their limitations. Join using `event_type`; `event_id` identifies a particular occurrence and is shared by its participant rows. These definitions describe pipeline labels, so they may be identical across versions and do not assert that every type occurred or was available in that version. Objective IDs and raw upgrade codes are not item catalog IDs.
 
-The necessary complexity remains in replay clock/player alignment, measurement normalization, and chunked lake retrieval: the public SQL endpoint limits response size, so records are chunked and checked to prevent silent truncation. Deadem/engine are pinned to 4.0.1 with a small adapter for the replay-declared `fixed8` encoding, `CUtlBinaryBlock`, and `CGlobalSymbol`. Binary blocks remain lossless byte arrays. These newer encodings caused the October 1 missing-entity errors; the adapter fixes decoding without ignoring entities or fabricating state. Decoder extensions are recorded in the replay summary and `game_versions`.
+If exact-version assets are unavailable, an event codebook is still written for a known client version. No empty item catalog replaces an existing one, and current-version assets are never substituted for missing historical definitions.
 
-After the decoder fix, all three reported failures (109509684, 109507240, 109510742; version 6730) parsed and saved successfully. Their 924, 1,356, and 1,968 player-state rows passed roster, source-time, team-total, and fresh net-worth checks. Replay hero-kill counts matched metadata deaths (70, 83, 135). The older 108313916 replay still produced byte-identical decoded extracts. Separate failure-path checks verified concise messages, continued collection, and preservation of previous successful extracts.
+## Game clock and sampling
 
-At the initial simplification, source/configuration files decreased from 42 to 14 and Python/JS from 6,655 lines (4,007 excluding tests) to 1,740. Dependencies remain the same research stack; NumPy and the parser engine, previously transitive, are now explicit. Counts exclude installed dependencies and generated data.
+Time zero is the recorded gameplay start. The clock uses the replay's match-clock update anchor and actual tick interval when available. The fallback is `(effective_network_tick - total_paused_ticks) * tick_interval - game_start_time`, with the pause-start tick used during an ongoing pause. Pregame and postgame are excluded. Required clock anchors must be available; otherwise parsing fails rather than inventing a clock.
 
-Temporary verification outputs remain in `validation/` because automatic approval review blocked cleanup. They are ignored by Git, unused by the implementation, and can be removed manually. Existing datasets were accessed in place; the temporary outputs were generated for comparison. The initial verification confirmed all 42 original tracked file hashes and the paths, sizes and modification times of all 10,882 existing data files were unchanged.
+Sampling targets are `0, Δ, 2Δ, ...`. Complete tick updates are processed before taking state. Each target uses the latest valid state at or before it; there is no future backfill or interpolation. All 12 roster slots remain represented even when their state is missing. Prior states older than 2.1 actual tick intervals are left missing; this allows normal tick-boundary alignment without carrying state across gaps. Grid rows stop at the last observation, rather than extending a partial replay to the final duration. `observed_time_s` records the source state time, not the target time.
+
+The final observed gameplay state is appended at its actual time when off-grid, or marks the matching grid row. Metadata duration has whole-second precision, so an observed fractional gameplay ending up to one second beyond it is retained; the first verified game-end marker stops extraction before postgame cleanup. `is_final_observation` means the last observed gameplay state, not proof that the replay reaches match end. Event intervals are `(previous_timestamp, timestamp]`; counter differences describe interval changes, not exact event times. The first interval has no assumed zero baseline.
+
+## Events and source limitations
+
+Event participant rows share an `event_id`; count distinct event IDs to count events. Relevant IDs and participant roles are scalar columns; fields that do not apply stay null. Overlapping metadata/replay reports are reconciled before export. An item's removal does not by itself prove a sale, and definition prices are not actual payments/refunds. An objective's owning team differs from its attacking team. Midboss death and rejuvenator claim times must not be equated.
+
+`objective_team_id` identifies the objective owner; it is not the attacking team. `claiming_team_id` and `related_event_id` connect a known rejuvenator claim to its midboss event, with a null claim time when only the metadata identifies the team. Death `duration_s` is the recorded death duration and `time_to_kill_s` is separate. `event_source` identifies metadata, replay, or their reconciliation. `upgrade_id` and `upgrade_info` retain protocol codes, not inferred ability levels; `imbued_ability_id` identifies an imbue target. A metadata ability record without a verified action remains `ability_progression`, and unavailable definitions can leave an `item_record` classification.
+
+Verified replay `EPurchased`/`EUpgraded` notifications can label ability unlocks/upgrades. In the two demonstrations, these notifications describe item changes; ability progression is therefore retained with its timestamp, ability ID, and native upgrade codes. The packing of metadata upgrade codes has not been verified, so zero is not guessed to mean an unlock. Rejuvenator notifications likewise lack a verified action-code mapping; known claiming teams are retained with missing claim times.
+
+Versioned item/ability definitions are requested only for the replay's identified client version; current definitions are not substituted for unknown historical ones. Missing definitions or protocol fields reduce available event detail. Full damage/currency streams, general casts, inventory snapshots, and cooldown histories are deliberately outside this initial scope. An empty event result does not prove the game had no events if the source lacks coverage.
+
+## Eligibility, coverage, and failures
+
+Eligibility requires `duration_s > 900`, exactly 12 distinct slots in the complete roster, `game_mode = 1` (Normal), and `match_mode` in `{1, 4}` (Unranked/Ranked). `game_mode = 4` is Street Brawl and is excluded. Missing/conflicting evidence is unverified eligibility and produces no eligible research outputs. A capped bulk response cannot establish the full roster count.
+
+`collection_status.csv` distinguishes `complete`, `end_match_only`, `ineligible`, `unverified_eligibility`, and `failed`. It records the sampling interval, final observed gameplay time, replay-end coverage (true/false/unknown), and a short reason. `complete` means the requested research tables were written, not necessarily full replay coverage or availability of every optional definition. Coverage is true when an end marker agrees with metadata duration within two seconds, false when observations end clearly earlier, and blank when uncertain. Eligibility and replay coverage are separate: partial replay observations can be retained for an eligible match. The `matches` and `end_match` outputs survive replay retrieval or parsing failure; this retains the status name `end_match_only`. A failed rebuild preserves earlier successful tables and their recorded interval, with the new failure recorded separately.
+
+`failures.csv` contains active failures with `match_id, stage, reason, attempted_at_utc`. Ordinary runs skip these IDs before querying; `retry` permits another attempt, and successful recovery clears the active failure. Expected per-match failures are reported and collection continues. Unexpected programming errors remain visible with a traceback.
+
+## Verification performed
+
+On October 4, 2026, matches `109509684` and `109507240` passed eligibility and were collected from the live API and downloaded replays. Both have 12 end-match rows. They produced 924/1,356 player rows at 20 seconds, then 324/468 at 60 seconds, including their final observations. Shared timestamps were identical across both resolutions. The reprocessing check prohibited replay downloads and confirmed unchanged replay file sizes/modification times. The demonstration files currently use 60 seconds; the configuration default remains 20.
+
+Checks passed for unique keys, all 12 slots per timestamp, no future observations, flat typed Parquet, exact IDs, CSV blank nulls, and cleared failure records. Distinct kill events were 70 and 83, matching final death totals. A real Street Brawl match (`110406116`, eight players) was excluded. Completed ordinary reruns were skipped. Small synthetic checks covered the strict 900-second boundary, mode separation, unknown eligibility, UInt64 precision, sparse final statistics, event reconciliation, failure/retry behavior, retention after failures, and removal only after successful output writes. Sampler checks covered gaps, near-grid timestamps, and fractional final states. No large test framework is included.
+
+Replay-salt discovery was verified against the live SQL/MCP service, including pagination and exclusions before the candidate limit. Automatic collection with a 30-candidate limit completed match `110926913` at 20 seconds: 12 end-match rows, 1,608 time-slice rows, and 922 event participant rows, with replay-end coverage confirmed. The run skipped one short match and had no failures. A subsequent discovery returned 30 candidates while excluding both newly handled matches. Focused checks covered empty/malformed query responses, exact IDs, and exclusions under retry, rebuild, changed intervals, and missing output files.
+
+The shared-field migration split all 122 existing end-match files. Joining `matches` back to `end_match` reproduced every original value exactly; time slices, events, collection/failure logs, and retained replays were unchanged. Version catalogs for clients 6730 and 6745 contain 729 and 738 asset definitions respectively, and 13 event-type definitions each. Every nonzero item/ability ID used in the existing events was present in its corresponding catalog. Checks also covered migration reruns, fresh metadata normalization, and collection output wiring with retained replay observations supplied in place of rerunning the parser.
+
+## Sources
+
+- [Deadlock API data lake and MCP access](https://deadlock-api.com/data-dumps), used to discover matches with recorded replay salts.
+- [Deadlock API metadata implementation](https://github.com/deadlock-api/deadlock-api/blob/master/api/src/routes/v1/matches/metadata.rs) and [API mode definitions](https://github.com/deadlock-api/deadlock-api/blob/master/api/src/routes/v1/matches/types.rs).
+- [Valve metadata protocol](https://github.com/SteamDatabase/Protobufs/blob/master/deadlock/citadel_gcmessages_common.proto), [replay header](https://github.com/SteamDatabase/Protobufs/blob/master/deadlock/demo.proto), and [user messages](https://github.com/SteamDatabase/Protobufs/blob/master/deadlock/citadel_usermessages.proto).
+- [deadem parser/engine](https://github.com/Igor-Losev/deadem), pinned to `4.0.1`; the parser includes the original project's small decoder fixes for newer Source 2 fields.
+- [Extracted Valve currency enum](https://github.com/SteamTracking/GameTracking-Deadlock/blob/master/DumpSource2/schemas/client/ECurrencyType.h), [player state schema](https://github.com/SteamTracking/GameTracking-Deadlock/blob/master/DumpSource2/schemas/client/PlayerDataGlobal_t.h), and [Deadworks game-clock implementation](https://github.com/Deadworks-net/deadworks/blob/76f73b504d7b811b678d092a1e762a8e08b5d2d9/managed/DeadworksManaged.Api/GameRules.cs).

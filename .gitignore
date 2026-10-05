@@ -1,8 +1,7 @@
+data/
 .venv/
+node_modules/
 __pycache__/
 *.pyc
-data/
-agent/replay/node_modules/
-agent/research/
-agent/legacy_data/
-agent/legacy_code.zip
+.validation/
+other/

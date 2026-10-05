@@ -1,0 +1,16 @@
+# Paths are relative to this configuration file. Empty IDs/file enable discovery.
+match_ids = []
+match_ids_file = ""
+sampling_interval_s = 20
+output_dir = "data"
+retain_replays = true
+export_csv = false
+retry_failures = false
+rebuild_outputs = false
+
+# Discovery: select matches with recorded replay salts; stop at discovery_count successes.
+# discovery_limit caps candidates after excluding matches this run would skip.
+discovery_count = 1
+discovery_limit = 30
+api_base = "https://api.deadlock-api.com"
+disable_steam = true
