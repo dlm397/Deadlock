@@ -4,7 +4,7 @@ The goal of this project is practicing using statistical tools. But, to that end
 
 ## Current Research
 
-Consider the contents of `research/` for what I am currently doing, and what I have done. As of last updating, I am playing with a double pre-train plus fine-tuning win prediction architecture, see [model outline](research/model/outline.pdf), I do not expect this to be fruitful, it is implementation practice concurrent with reading Simon J. D. Prince’s [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/).
+Consider the contents of `research/` for what I am currently doing, and what I have done. As of last updating, I am playing with a double pre-train plus fine-tuning win prediction architecture, see [model outline](research/model/buildTex/outline.pdf), I do not expect this to be fruitful, it is implementation practice concurrent with reading Simon J. D. Prince’s [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/).
 
 ## Project layout
 
