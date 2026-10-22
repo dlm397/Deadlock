@@ -1,26 +1,31 @@
 # Deadlock
 
-summary-placeholder
+The goal of this project is practicing using statistical tools. But, to that end, I first needed data, so this was a simple data pipe, that just downloaded, parsed, and stored game. Now, I have enough games to start doing analysis.
+
+## Current Research
+
+Consider the contents of `research/` for what I am currently doing, and what I have done. As of last updating, I am playing with a double pre-train plus fine-tuning win prediction architecture, see [model outline](research/model/outline.pdf), I do not expect this to be fruitful, it is implementation practice concurrent with reading Simon J. D. Prince’s [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/).
 
 ## Project layout
 
 ```text
-Deadlock2/
+Deadlock/
+  .venv/
+  .validation/         # local verification artifacts and code backups
   pipeline.py          # command to run the pipeline
   config.toml          # settings to edit
   README.md
   app/                 # Python code, replay parser, dependencies
   other/               # legacy importer and CSV cleanup utility
-  data/                # research outputs and retained replays
-  .venv/               # Python environment
-  .validation/         # local verification artifacts and code backups
+  research/            # analysis tools and results
+  data/                # retained replays and parsed outputs
 ```
 
 The implementation is in `app/pipeline.py`; the top level `pipeline.py` is a launcher.
 
-## Install and run
+## Running
 
-Uses Python 3.11+ and Node.js 18+. Edit `config.toml` for settings. For desired match ID's, set `match_ids = [123456, 234567]`, or set `match_ids_file` to a text file of IDs. Empty IDs and file enable discovery through the Deadlock API's public SQL/MCP endpoint. Discovery selects newest match IDs with recorded replay salts, metadata salts, and replay server identifiers. Every candidate, including an explicitly supplied ID, must pass the same eligibility check using its full individual match metadata.
+Edit `config.toml` for settings. For desired match ID's, set `match_ids = [123456, 234567]`, or set `match_ids_file` to a text file of IDs. Empty IDs and file enable discovery through the Deadlock API's public SQL/MCP endpoint. Discovery selects newest match IDs with recorded replay salts, metadata salts, and replay server identifiers. Every candidate, including an explicitly supplied ID, must pass the same eligibility check using its full individual match metadata.
 
 ```powershell
 # Discovers and downloads match, using settings in comfig.toml
@@ -38,8 +43,6 @@ python pipeline.py retry
 ```
 
 All commands accept `--config path/to/config.toml`, `--match-ids`, `--match-file`, `--interval`, `--retry-failures`, `--rebuild`, and `--csv`. With no command, collection is the default.
-
-Progress, warnings, errors, and summary messages include timestamps.
 
 `reprocess` uses selected retained replay files, or all retained replays when no IDs are selected. It can fetch small metadata and versioned definitions again, but does not download the replay again. `retry` explicitly retries active failures; absent an explicit/configured selection, it uses the failure log. Ordinary collection and reprocessing skip failures unless `--retry-failures` is set. Collection skips complete outputs at the requested interval. Use `--rebuild` when changing extracted variables without changing the interval.
 
@@ -95,7 +98,7 @@ The column definitions and source mappings are kept near the top of `app/normali
 
 Explicit metadata final counters take priority. Combat values come from one metadata snapshot whose integer `time_stamp_s` equals `duration_s`. `combat_stats_time_s` is that timestamp and `combat_stats_at_end` reports whether that snapshot exists. If it does not exist, the combat values/time are null and the flag is false. Individual absent fields remain null even when the flag is true. There is no fallback to an earlier snapshot, so these fields share one observation time. Sparse metadata snapshots are not inserted into the replay timeline.
 
-`net_worth` and `unspent_souls` are different variables. Replay `hero_damage_taken` remains null where no verified cumulative replay field is available. Position units are Source 2 world units, not meters. A client version, replay build number, replay patch version, and game-mode version remain separate; no unverified readable balance-patch label is assigned. `hero_build_id` is a player's selected build guide, not a software version, and is not exported.
+`net_worth` and `unspent_souls` are different variables. Replay `hero_damage_taken` remains null where no verified cumulative replay field is available. Position units are Source 2 world units. A client version, replay build number, replay patch version, and game-mode version remain separate; no unverified readable balance-patch label is assigned. `hero_build_id` is a player's selected build guide, not a software version, and is not exported.
 
 ## Version definitions
 
@@ -127,24 +130,14 @@ Versioned item/ability definitions are requested only for the replay's identifie
 
 ## Eligibility, coverage, and failures
 
-Eligibility requires `duration_s > 900`, exactly 12 distinct slots in the complete roster, `game_mode = 1` (Normal), and `match_mode` in `{1, 4}` (Unranked/Ranked). `game_mode = 4` is Street Brawl and is excluded. Missing/conflicting evidence is unverified eligibility and produces no eligible research outputs. A capped bulk response cannot establish the full roster count.
+Eligibility requires `duration_s > 900`, exactly 12 distinct slots in the complete roster, `game_mode = 1` (Normal), and `match_mode` in `{1, 4}` (Unranked/Ranked). `game_mode = 4` is Street Brawl and is excluded. Missing/conflicting evidence is unverified eligibility and produces no eligible outputs. A capped bulk response cannot establish the full roster count.
 
 `collection_status.csv` distinguishes `complete`, `end_match_only`, `ineligible`, `unverified_eligibility`, and `failed`. It records the sampling interval, final observed gameplay time, replay-end coverage (true/false/unknown), and a short reason. `complete` means the requested research tables were written, not necessarily full replay coverage or availability of every optional definition. Coverage is true when an end marker agrees with metadata duration within two seconds, false when observations end clearly earlier, and blank when uncertain. Eligibility and replay coverage are separate: partial replay observations can be retained for an eligible match. The `matches` and `end_match` outputs survive replay retrieval or parsing failure; this retains the status name `end_match_only`. A failed rebuild preserves earlier successful tables and their recorded interval, with the new failure recorded separately.
 
 `failures.csv` contains active failures with `match_id, stage, reason, attempted_at_utc`. Ordinary runs skip these IDs before querying; `retry` permits another attempt, and successful recovery clears the active failure. Expected per-match failures are reported and collection continues. Unexpected programming errors remain visible with a traceback.
 
-## Verification performed
-
-On October 4, 2026, matches `109509684` and `109507240` passed eligibility and were collected from the live API and downloaded replays. Both have 12 end-match rows. They produced 924/1,356 player rows at 20 seconds, then 324/468 at 60 seconds, including their final observations. Shared timestamps were identical across both resolutions. The reprocessing check prohibited replay downloads and confirmed unchanged replay file sizes/modification times. The demonstration files currently use 60 seconds; the configuration default remains 20.
-
-Checks passed for unique keys, all 12 slots per timestamp, no future observations, flat typed Parquet, exact IDs, CSV blank nulls, and cleared failure records. Distinct kill events were 70 and 83, matching final death totals. A real Street Brawl match (`110406116`, eight players) was excluded. Completed ordinary reruns were skipped. Small synthetic checks covered the strict 900-second boundary, mode separation, unknown eligibility, UInt64 precision, sparse final statistics, event reconciliation, failure/retry behavior, retention after failures, and removal only after successful output writes. Sampler checks covered gaps, near-grid timestamps, and fractional final states. No large test framework is included.
-
-Replay-salt discovery was verified against the live SQL/MCP service, including pagination and exclusions before the candidate limit. Automatic collection with a 30-candidate limit completed match `110926913` at 20 seconds: 12 end-match rows, 1,608 time-slice rows, and 922 event participant rows, with replay-end coverage confirmed. The run skipped one short match and had no failures. A subsequent discovery returned 30 candidates while excluding both newly handled matches. Focused checks covered empty/malformed query responses, exact IDs, and exclusions under retry, rebuild, changed intervals, and missing output files.
-
-The shared-field migration split all 122 existing end-match files. Joining `matches` back to `end_match` reproduced every original value exactly; time slices, events, collection/failure logs, and retained replays were unchanged. Version catalogs for clients 6730 and 6745 contain 729 and 738 asset definitions respectively, and 13 event-type definitions each. Every nonzero item/ability ID used in the existing events was present in its corresponding catalog. Checks also covered migration reruns, fresh metadata normalization, and collection output wiring with retained replay observations supplied in place of rerunning the parser.
-
 ## Sources
-
+- [Understanding Deep Learning](https://udlbook.github.io/udlbook/) by Simon J. D. Prince (MIT Press, 2023)
 - [Deadlock API data lake and MCP access](https://deadlock-api.com/data-dumps), used to discover matches with recorded replay salts.
 - [Deadlock API metadata implementation](https://github.com/deadlock-api/deadlock-api/blob/master/api/src/routes/v1/matches/metadata.rs) and [API mode definitions](https://github.com/deadlock-api/deadlock-api/blob/master/api/src/routes/v1/matches/types.rs).
 - [Valve metadata protocol](https://github.com/SteamDatabase/Protobufs/blob/master/deadlock/citadel_gcmessages_common.proto), [replay header](https://github.com/SteamDatabase/Protobufs/blob/master/deadlock/demo.proto), and [user messages](https://github.com/SteamDatabase/Protobufs/blob/master/deadlock/citadel_usermessages.proto).
