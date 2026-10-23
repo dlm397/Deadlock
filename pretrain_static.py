@@ -2,30 +2,40 @@
 Stage 1 of research/model/outline.tex: supervised static player pre-training.
 
 Run `python pretrain_static.py --help` for train, predict, and verify commands.
-Only hero identity and initial_rank_badge enter the player encoder.
+Read the selected match_player view in the end-match DuckDB database.
+Only hero identity and pre-match rank enter the player encoder.
 """
 
 import argparse
 import csv
 from datetime import datetime, timezone
+from itertools import groupby
 import json
 import math
 import os
 from pathlib import Path
 import random
 import statistics
-import tomllib
+import tempfile
 
-import pyarrow.parquet as pq
+import duckdb
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from app.console_log import log
+from app.config import DEFAULT_CONFIG, data_paths
 
 
 ROOT = Path(__file__).resolve().parent
 PLAYER_COLUMNS = ["match_id", "player_slot", "hero_id", "team_id", "initial_rank_badge"]
+RANK_SOURCE = "player_rank_initial_display_rank"
+# Explicit projection: final ranks, stats, won, and other outcomes are never inputs.
+PLAYER_PROJECTION = f"""
+    match_id, player_slot, hero_id,
+    CASE team WHEN 'Team0' THEN 0 WHEN 'Team1' THEN 1 END AS team_id,
+    {RANK_SOURCE} AS initial_rank_badge
+"""
 SPLITS = ("train", "validation", "test")
 ARCHITECTURE = {
     "hero_embedding_dim": 16,
@@ -63,7 +73,7 @@ def write_json(path, value):
 
 
 def rank_value(value):
-    """The normalizer maps unknown badge 0 to null; accept both at inference."""
+    """Lake ranks are null when unavailable and zero during placements."""
     if value is None:
         return None
     if type(value) is not int or value < 0:
@@ -89,38 +99,47 @@ def ordered_players(players):
     return sorted(players, key=lambda p: (p["team_id"], p["player_slot"]))
 
 
-def read_players(data_dir, match_id):
-    # Explicit column selection prevents terminal statistics from becoming inputs.
-    players = pq.read_table(data_dir / "end_match" / f"{match_id}.parquet", columns=PLAYER_COLUMNS).to_pylist()
-    if any(p["match_id"] != match_id for p in players):
-        raise ValueError(f"Match {match_id}: player match IDs disagree with filename")
+def open_database(database):
+    database = Path(database)
+    if not database.is_file():
+        raise FileNotFoundError(f"No end-match DuckDB database at {database}. "
+                                "Run python pipeline.py end-match collect first, or pass --database.")
+    return duckdb.connect(str(database), read_only=True)
+
+
+def read_players(database, match_id):
+    # Inference does not query the outcome, even for a historical match.
+    with open_database(database) as connection:
+        rows = connection.execute(f"SELECT {PLAYER_PROJECTION} FROM match_player "
+                                  "WHERE match_id = ? ORDER BY player_slot", [match_id]).fetchall()
+    if not rows:
+        raise ValueError(f"Match {match_id} is not in the selected match_player view")
+    players = [dict(zip(PLAYER_COLUMNS, row)) for row in rows]
     return ordered_players(players)
 
 
-def load_matches(data_dir):
+def load_matches(database):
+    """Load narrow static columns from selected complete matches, never the raw lake."""
     matches, skipped = [], []
-    for path in sorted((data_dir / "end_match").glob("*.parquet")):
-        match_id = int(path.stem)
-        header = data_dir / "matches" / path.name
-        if not header.exists():
-            skipped.append({"match_id": match_id, "reason": "missing match metadata"})
-            continue
-        rows = pq.read_table(header, columns=["match_id", "match_outcome", "winning_team_id"]).to_pylist()
-        if len(rows) != 1 or rows[0]["match_id"] != match_id:
-            raise ValueError(f"Match {match_id}: expected one matching metadata row")
-        outcome = rows[0]
-        if outcome["match_outcome"] != "TeamWin" or outcome["winning_team_id"] not in (0, 1):
+    with open_database(database) as connection:
+        rows = connection.execute(f"SELECT {PLAYER_PROJECTION}, match_outcome, winning_team "
+                                  "FROM match_player ORDER BY match_id, player_slot").fetchall()
+    for match_id, group in groupby(rows, key=lambda row: row[0]):
+        player_rows = list(group)
+        outcomes = {(row[-2], row[-1]) for row in player_rows}
+        if len(outcomes) != 1:
+            raise ValueError(f"Match {match_id}: conflicting outcome/winning-team labels")
+        outcome, winner = outcomes.pop()
+        if outcome != "TeamWin" or winner not in ("Team0", "Team1"):
             skipped.append({"match_id": match_id, "reason": "no verified TeamWin label"})
             continue
         try:
-            players = read_players(data_dir, match_id)
+            players = ordered_players([dict(zip(PLAYER_COLUMNS, row[:5])) for row in player_rows])
         except ValueError as error:
             raise ValueError(f"Match {match_id}: {error}") from error
-        matches.append({"match_id": match_id, "players": players, "label": float(outcome["winning_team_id"] == 1)})
+        matches.append({"match_id": match_id, "players": players, "label": float(winner == "Team1")})
     if not matches:
-        raise ValueError(f"No labeled matches found under {data_dir}")
-    if len({m["match_id"] for m in matches}) != len(matches):
-        raise ValueError("Duplicate match IDs")
+        raise ValueError(f"No labeled matches found in {database}'s selected match_player view")
     return matches, skipped
 
 
@@ -132,32 +151,53 @@ def write_splits(path, assignments, mode="w"):
         writer.writerows((mid, assignments[mid]) for mid in sorted(assignments, key=int))
 
 
-def get_splits(match_ids, path, seed, validation_fraction, test_fraction):
+def get_splits(match_ids, path, seed, validation_fraction, test_fraction, extend=False):
     """Existing assignments are authoritative, including IDs absent in this stage."""
-    if path.exists():
-        assignments = {}
+    exists = path.exists()
+    original = path.read_bytes() if exists else None
+    assignments = {}
+    if exists:
         with path.open(encoding="utf-8-sig", newline="") as stream:
-            for row in csv.DictReader(stream):
+            reader = csv.DictReader(stream)
+            if not reader.fieldnames or not {"match_id", "split"}.issubset(reader.fieldnames):
+                raise ValueError(f"{path} must have match_id,split CSV columns")
+            for row in reader:
                 mid = str(int(row["match_id"]))
                 if mid in assignments or row["split"] not in SPLITS:
                     raise ValueError(f"Invalid or duplicate split assignment for match {mid}")
                 assignments[mid] = row["split"]
-        missing = set(map(str, match_ids)) - assignments.keys()
-        if missing:
-            raise ValueError(f"{path} lacks {len(missing)} match IDs. Extend it explicitly; existing splits must be preserved.")
-    else:
-        ids = sorted(match_ids)
+    missing = set(map(str, match_ids)) - assignments.keys()
+    if missing and exists and not extend:
+        raise ValueError(f"{path} lacks {len(missing)} match IDs. Extend it explicitly with --extend-splits; "
+                         "existing splits will be preserved.")
+    if missing:
+        ids = sorted(map(int, missing))
         random.Random(seed).shuffle(ids)
-        n_validation = max(1, int(len(ids) * validation_fraction))
-        n_test = max(1, int(len(ids) * test_fraction))
+        minimum = 1 if len(ids) >= 3 else 0
+        n_validation = max(minimum, int(len(ids) * validation_fraction))
+        n_test = max(minimum, int(len(ids) * test_fraction))
         if n_validation + n_test >= len(ids):
             raise ValueError("Need enough matches for nonempty training, validation, and test splits")
-        assignments = {str(mid): ("validation" if i < n_validation else
-                                 "test" if i < n_validation + n_test else "train") for i, mid in enumerate(ids)}
-        # Exclusive creation prevents accidentally overwriting another run's splits.
-        write_splits(path, assignments, mode="x")
+        assignments.update({str(mid): ("validation" if i < n_validation else
+                                       "test" if i < n_validation + n_test else "train") for i, mid in enumerate(ids)})
     if any(not any(assignments[str(mid)] == split for mid in match_ids) for split in SPLITS):
         raise ValueError("The current dataset must contain matches in all three splits")
+    if missing and exists:
+        # Keep the original CSV bytes and add only new rows. Replace atomically.
+        with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as stream:
+            temporary = Path(stream.name)
+        try:
+            temporary.write_bytes(original + (b"\n" if original and not original.endswith(b"\n") else b""))
+            with temporary.open("a", encoding="utf-8", newline="") as stream:
+                csv.writer(stream).writerows((mid, assignments[mid]) for mid in sorted(missing, key=int))
+            if path.read_bytes() != original:
+                raise ValueError("Split manifest changed during loading; retry to preserve the other assignments")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    elif not exists:
+        # Exclusive creation prevents accidentally overwriting another run's splits.
+        write_splits(path, assignments, mode="x")
     return assignments
 
 
@@ -172,6 +212,7 @@ def fit_preprocessing(training_matches):
         "unknown_hero_policy": "fixed zero embedding for IDs not seen in training",
         "rank": {
             "field": "initial_rank_badge",
+            "source_field": RANK_SOURCE,
             "method": "training median imputation, training min-max scaling, clip to [0, 1]",
             "missing_values": [None, 0],
             "median": float(statistics.median(known_ranks)) if known_ranks else 0.0,
@@ -278,14 +319,14 @@ def train(args):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     device = torch.device(args.device)
-    data_dir = resolve_data_dir(args)
-    log(f"Reading static inputs from {data_dir}")
-    matches, skipped = load_matches(data_dir)
-    split_path = (args.splits or data_dir / "splits.csv").resolve()
+    database = resolve_database(args)
+    log(f"Reading static inputs from {database} (selected match_player view)")
+    matches, skipped = load_matches(database)
+    split_path = resolve_split_path(args, database.parent)
     split_seed = args.seed if args.split_seed is None else args.split_seed
     reused_splits = split_path.exists()
     assignments = get_splits([m["match_id"] for m in matches], split_path, split_seed,
-                             args.validation_fraction, args.test_fraction)
+                             args.validation_fraction, args.test_fraction, extend=args.extend_splits)
     groups = {split: [m for m in matches if assignments[str(m["match_id"])] == split] for split in SPLITS}
     preprocessing = fit_preprocessing(groups["train"])
     datasets = {}
@@ -298,21 +339,26 @@ def train(args):
     run_dir = args.output_dir / f"run_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}_seed{args.seed}"
     run_dir.mkdir(parents=True, exist_ok=False)
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
-    config.update(data_dir=str(data_dir), splits=str(split_path), effective_split_seed=split_seed,
+    config.update(database=str(database), data_dir=str(database.parent), splits=str(split_path), effective_split_seed=split_seed,
                   reused_splits=reused_splits, optimizer="AdamW", weight_decay=0.0,
                   loss="BCEWithLogitsLoss", deterministic_algorithms=True, torch_version=str(torch.__version__))
     metadata = {
-        "format_version": 1, "architecture": ARCHITECTURE, "preprocessing": preprocessing,
-        "conventions": {"team_order": [0, 1], "positive_label": "winning_team_id == 1",
+        "format_version": 2, "architecture": ARCHITECTURE, "preprocessing": preprocessing,
+        "data_source": {"kind": "duckdb", "database": str(database), "relation": "match_player",
+                        "selection": "Only matches selected and currently eligible in the end-match pipeline",
+                        "rank_field": RANK_SOURCE, "hero_field": "hero_id"},
+        "conventions": {"team_order": [0, 1], "positive_label": "winning_team == 'Team1'",
+                        "source_team_mapping": {"Team0": 0, "Team1": 1},
                         "probability": "P(canonical team_id 1 wins)",
                         "inputs": ["hero_id", "initial_rank_badge"],
                         "roster_keys_only": ["match_id", "player_slot", "team_id"],
-                        "label_source": "matches.winning_team_id with match_outcome == TeamWin"},
+                        "label_source": "match_player.winning_team with match_outcome == TeamWin"},
         "split_assignments": assignments,
         "active_match_ids": {split: [m["match_id"] for m in groups[split]] for split in SPLITS},
         "training_config": config,
     }
-    audit = {"rank_availability": {split: rank_report(groups[split]) for split in SPLITS}, "skipped": skipped}
+    audit = {"rank_availability": {"all": rank_report(matches),
+                                    **{split: rank_report(groups[split]) for split in SPLITS}}, "skipped": skipped}
     write_json(run_dir / "metadata.json", metadata)
     write_json(run_dir / "data_audit.json", audit)
     write_splits(run_dir / "split_matches.csv", assignments)
@@ -376,11 +422,23 @@ def train(args):
 
 
 def resolve_data_dir(args):
+    if args.database is not None:
+        return args.database.resolve().parent
     if args.data_dir is not None:
         return args.data_dir.resolve()
-    with args.config.open("rb") as stream:
-        config = tomllib.load(stream)
-    return (args.config.parent / config["output_dir"]).resolve()
+    return data_paths(args.config)["end_match"]
+
+
+def resolve_database(args):
+    return args.database.resolve() if args.database is not None else resolve_data_dir(args) / "end_match.duckdb"
+
+
+def resolve_split_path(args, data_dir):
+    if args.splits:
+        return args.splits.resolve()
+    if args.data_dir is None and args.database is None:
+        return data_paths(args.config)["supplemental"] / "splits.csv"
+    return (data_dir / "splits.csv").resolve()
 
 
 def build_parser():
@@ -390,13 +448,16 @@ def build_parser():
     prediction = commands.add_parser("predict", help="Reload and report team 1 win probability")
     verification = commands.add_parser("verify", help="Verify saved evaluation predictions after reload")
     for command in (training, prediction):
-        command.add_argument("--config", type=Path, default=ROOT / "config.toml")
-        command.add_argument("--data-dir", type=Path, help="Override config.toml output_dir")
+        command.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+        location = command.add_mutually_exclusive_group()
+        location.add_argument("--database", type=Path, help="Override the configured end-match DuckDB file")
+        location.add_argument("--data-dir", type=Path, help="Directory containing end_match.duckdb")
         command.add_argument("--device", default="cpu")
-    training.add_argument("--output-dir", type=Path, default=ROOT / "research" / "outputs" / "pretrain_static")
-    training.add_argument("--splits", type=Path, help="Existing match_id,split CSV; default: <data-dir>/splits.csv")
+    training.add_argument("--output-dir", type=Path, default=ROOT / "data" / "supplemental" / "pretrain_static")
+    training.add_argument("--splits", type=Path, help="Match split CSV; default: shared supplemental/splits.csv, or beside an explicitly selected database")
+    training.add_argument("--extend-splits", action="store_true", help="Assign new match IDs while preserving every existing split assignment")
     training.add_argument("--seed", type=int, default=42)
-    training.add_argument("--split-seed", type=int, help="Defaults to seed; ignored when reusing splits")
+    training.add_argument("--split-seed", type=int, help="Defaults to seed; used only for new match assignments")
     training.add_argument("--validation-fraction", type=float, default=0.1)
     training.add_argument("--test-fraction", type=float, default=0.1)
     training.add_argument("--epochs", type=int, default=100)
@@ -419,7 +480,7 @@ def main():
     elif args.command == "predict":
         model, checkpoint = load_stage1(args.checkpoint, args.device)
         players = (json.loads(args.players.read_text(encoding="utf-8")) if args.players
-                   else read_players(resolve_data_dir(args), args.match_id))
+                   else read_players(resolve_database(args), args.match_id))
         probability = win_probabilities(model, [players], checkpoint["preprocessing"]).item()
         print(json.dumps({"team_1_win_probability": probability, "team_0_win_probability": 1 - probability}))
     else:

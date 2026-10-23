@@ -1,0 +1,38 @@
+# data_dir is relative to this config folder. Dataset output_dir and
+# supplemental_dir are relative to data_dir and must stay inside it.
+[paths]
+data_dir = "../data"
+supplemental_dir = "supplemental"
+
+# Source 2 replay collection. Metadata supports eligibility and identity;
+# successful collection always includes replay parsing.
+[full_match]
+output_dir = "full_match"
+match_ids = []
+match_ids_file = ""
+sampling_interval_s = 20
+retain_replays = true
+export_csv = false
+retry_failures = false
+rebuild_outputs = false
+# Full-match: 150 games took 370 minutes, ~2.4 minutes/match, ~25 matches/hour.
+discovery_count = 50
+discovery_limit = 600
+api_base = "https://api.deadlock-api.com"
+disable_steam = true
+
+# Public Parquet data lake; no Source 2 replay or API metadata collection.
+[end_match]
+output_dir = "end_match"
+manifest_url = "https://data.deadlock-api.com/v1/manifest.json"
+match_ids = []
+match_ids_file = ""
+# Maximum NEW complete matches added per invocation (existing matches refresh).
+match_limit = 4000
+# Explicit per-invocation download bounds; no scan of the entire lake.
+max_download_mib = 2048
+max_files = 5
+retain_shards = true
+export_csv = false
+retry_failures = false
+rebuild_outputs = false

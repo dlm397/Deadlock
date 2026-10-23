@@ -1,4 +1,4 @@
-"""Run the Deadlock research pipeline from the project directory."""
+"""Launch full-match replay or end-match data-lake collection."""
 
 from app.pipeline import main
 

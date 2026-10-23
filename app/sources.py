@@ -44,7 +44,7 @@ def _match_id(value):
     if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
         value = int(value)
     if type(value) is not int or not 0 < value < 2**64:
-        raise ValueError("replay discovery returned an invalid match ID")
+        raise ValueError("match discovery returned an invalid match ID")
     return value
 
 
@@ -96,7 +96,11 @@ def _discovery_ids(result):
 
 
 def discover(config, exclude=()):
-    """Find candidates with known replay salts; metadata still verifies eligibility."""
+    """Discover full-match candidates with recorded replay salts through MCP.
+
+    Explicit match IDs skip discovery. Large discovery limits can exceed the
+    service's MCP query limits; this is independent of the dump pipeline.
+    """
     headers = {"Accept": "application/json, text/event-stream"}
     endpoint = config["api_base"].rstrip("/") + "/v1/mcp"
 
@@ -133,8 +137,9 @@ def discover(config, exclude=()):
     page_size = min(100, limit)
     while len(selected) < limit:
         before = f" AND match_id < {cursor}" if cursor is not None else ""
-        query = ("SELECT DISTINCT match_id FROM match_salts WHERE match_id > 0 AND replay_salt IS NOT NULL "
-                 "AND replay_salt != 0 AND metadata_salt IS NOT NULL AND metadata_salt != 0 "
+        query = ("SELECT DISTINCT match_id FROM match_salts WHERE match_id > 0 "
+                 "AND replay_salt IS NOT NULL AND replay_salt != 0 "
+                 "AND metadata_salt IS NOT NULL AND metadata_salt != 0 "
                  f"AND cluster_id IS NOT NULL AND cluster_id != 0{before} "
                  f"ORDER BY match_id DESC LIMIT {page_size}")
         ids = _discovery_ids(rpc("tools/call", {"name": "execute_query", "arguments": {"sql": query}}))

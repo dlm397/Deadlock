@@ -66,9 +66,10 @@ def _write_csv(path, columns, rows):
         temporary.unlink(missing_ok=True)
 
 
-def write_version_tables(root, client_version, items):
+def write_version_tables(supplemental_dir, client_version, items):
     """Write small CSV catalogs; return whether this version's item catalog exists.
 
+    Catalogs live in supplemental_dir/version, outside either match dataset.
     `items` must be the exact-version API definitions. The shared catalog labels
     item_id, ability_id and imbued_ability_id; absent scalar values stay blank.
     Unknown versions produce no files. Empty definitions never erase a catalog.
@@ -76,7 +77,7 @@ def write_version_tables(root, client_version, items):
     if client_version is None:
         return False
     version = _exact_id(client_version, "client_version")
-    folder = Path(root) / "version"
+    folder = Path(supplemental_dir) / "version"
     folder.mkdir(parents=True, exist_ok=True)
     event_rows = [dict(zip(EVENT_COLUMNS, (version, *definition)))
                   for definition in EVENT_DEFINITIONS]
