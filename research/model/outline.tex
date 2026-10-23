@@ -207,7 +207,7 @@
 
 \newpage
 \section{Training}
-    In order to meet the goals of this sub-project, and take advantage of all the available data, this is the following training procedure I have come up with for this model. Note that numerical values for parameters are intial quantities and will likely be adjusted during training.
+    In order to meet the goals of this sub-project, and take advantage of all the available data, this is the following training procedure I have come up with for this model. Note that numerical values for parameters are initial quantities and will likely be adjusted during training.
 % Graph of training order
     \begin{figure}[H]
     \centering
@@ -322,10 +322,10 @@
     }
     \label{fig:training-procedure}
     \end{figure}
-    using this high-level overview, I now consider each step in more detail.
+    Using this high-level overview, I now consider each step in more detail.
 
-    \subsection{Pre-Train 1 - Static Embeddings}
-        The goal of this pre-training stage is to learn hero embeddings and a shared MLP that combines hero identity with pre-match rank. These components produce static player representations that are transferred to the subsequent training stages.
+\subsection{Pre-Train 1 - Static Embeddings}
+        In this first stage, I want to learn hero embeddings and a shared MLP that combines hero identity with pre-match rank. I then use these static player representations in the later training stages.
     \subsubsection{Architecture}
 % Detailed graph of training architecture for embedding pre-train
         \begin{figure}[H]
@@ -378,7 +378,7 @@
         };
 
         \node[output, below=of teams] (head) {
-            Temporary Win-Prediction MLP
+            Win-Prediction MLP
         };
 
         \node[output, below=of head] (win) {
@@ -406,9 +406,9 @@
         \end{figure}
 
     \subsubsection{Loss function}
-        Since this is a win-prediction task, I use binary cross-entropy between prediect probability that team 1 wins and the observed outcome. For the same of numerical stability, loss is computed directly from the output logit using \texttt{BCEWithLogitsLoss}.
+        Since this is a win-prediction task, I use binary cross-entropy between the predicted probability that team 1 wins and the observed outcome. For the sake of numerical stability, loss is computed directly from the output logit using \texttt{BCEWithLogitsLoss}.
     \subsubsection{Optimizer and learning rate}
-        I use AdamW with an initial learning rate of $10^{-3}$ and weight decay of $10^{-4}$. These are starting values, an may be adjusted later based on validation loss.
+        I use AdamW with an initial learning rate of $10^{-3}$ and initially set weight decay to zero. I may adjust the learning rate or introduce weight decay later based on validation loss.
 
     \subsubsection{Batch size and training duration}
         I use mini-batches of 64 matches and will train for at most 100 epochs, shuffling the training matches at each epoch. I retain the checkpoint with the lowest validation binary cross-entropy.
@@ -416,31 +416,165 @@
     \subsubsection{Regularization and stopping criteria}
         I halt if the validation loss does not improve for 10 consecutive epochs. Initially, I do not use dropouts but this may change if training loss continues to decrease while validation loss worsens. Similarly, I initially do not use weight decay, but in the event of overfitting, I will.
 
-\subsection{Pre-Train 2 - Temporal Dyanmics}
+\subsection{Pre-Train 2 - Temporal Dynamics}
+    For the second pre-training stage, I want the model to learn about game dynamics by predicting changes from the observed match history. I initialize the hero embeddings and shared player MLP from Stage 1, then train these alongside the new components.
+
+    \subsubsection{Architecture}
+% Detailed graph of training architecture for learning temporal dynamics
+    \begin{figure}[H]
+    \centering
+    \begin{tikzpicture}[
+        font=\small,
+        node distance=6mm,
+        box/.style={
+            draw,
+            rounded corners,
+            align=center,
+            text width=6cm,
+            minimum height=9mm,
+            inner sep=5pt
+        },
+        input/.style={box, text width=4cm, fill=blue!8},
+        process/.style={box, fill=green!10},
+        output/.style={box, fill=orange!12},
+        arrow/.style={-{Stealth}, thick}
+    ]
+
+    \node[input] (hero) {
+        Static Representation\\
+        + Shared MLP
+    };
+
+    \node[input, right=8mm of hero] (state) {
+        Current Player Features\\
+        At Each Observed Frame
+    };
+
+    \coordinate (middle) at
+        ($(hero.south)!0.5!(state.south)$);
+
+    \node[process, below=9mm of middle] (concat) {
+        Concatenate and Project\\
+        One Token per Player
+    };
+
+    \node[process, below=of concat] (spatial) {
+        Spatial Transformer\\
+        within Frame Interactions
+    };
+
+    \node[process, below=of spatial] (pool) {
+        Pool by Team
+    };
+
+    \node[process, below=of pool] (frame) {
+        Concat. Team Summaries\\
+        and Global Features\\
+        Project to One Token per Frame
+    };
+
+    \node[input, right=7mm of frame, text width=2.6cm] (global) {
+        Global Features\\
+        At Each Observed Frame
+    };
+
+    \node[process, below=of frame] (temporal) {
+        Temporal Transformer\\
+        Frame Tokens + Temporal Encoding\\
+        Attend Only to Current and Earlier Frames
+    };
+
+    \node[output, below=of temporal] (head) {
+        Temporary Dynamics MLP\\
+        Applied to Each Temporal Output
+    };
+
+    \node[output, below=of head] (prediction) {
+        Predict Soul Difference between\\
+        current $t$ and future $t+1$ frames
+    };
+
+    \draw[arrow] (hero.south) --
+        (concat.north -| hero.south);
+    \draw[arrow] (state.south) --
+        (concat.north -| state.south);
+    \draw[arrow] (concat) -- (spatial);
+    \draw[arrow] (spatial) -- (pool);
+    \draw[arrow] (pool) -- (frame);
+    \draw[arrow] (global.west) -- (frame.east);
+    \draw[arrow] (frame) -- (temporal);
+    \draw[arrow] (temporal) -- (head);
+    \draw[arrow] (head) -- (prediction);
+
+    \end{tikzpicture}
+    \caption{
+        Dynamics pre-training architecture.
+        The output at frame $t$ predicts changes over the next
+        recorded interval using only frames $0{:}t$.
+        All components above the temporary dynamics head
+        transfer to the final win-prediction model.
+    }
+    \label{fig:pretrain2-architecture}
+    \end{figure}
+    \subsubsection{Prediction targets}
+        I want to predict selected next-frame changes in continuous variables, such as position, souls, and health, together with next-frame binary states, such as whether a player is alive or an objective remains standing. I exclude fixed attributes, like hero identity, and quantities I already know, like the next timestamp. For now, I start with a simple soul-difference prediction, but I may expand this later.
+
+    \subsubsection{Loss function}
+        I use mean squared error for continuous changes, which I standardize using training-set means and standard deviations. If I add binary targets, I will use binary cross-entropy computed from logits. I average each loss over its valid targets and exclude padded frames and missing targets. If I use both target groups, I will initially give them equal weight.
+
+    \subsubsection{Optimizer and learning rate}
+        I use AdamW with an initial learning rate of $10^{-4}$ for the transferred hero embeddings and static player MLP, and $\times10^{-3}$ for newly initialized components. Initially I set weight decay to zero, but may introduce it if validation performance indicates overfitting.
+
+    \subsubsection{Batch size and training duration}
+        I start with mini-batches of 8 match sequences and will train for at most 100 epochs. I average prediction losses within each match before averaging across matches, so longer matches do not automatically receive more weight.
+
+    \subsubsection{Regularization and stopping criteria}
+        I use dropout of $0.1$ within the transformer blocks and halt if validation loss does not improve for 10 consecutive epochs. I retain the checkpoint with the lowest validation loss and clip the total gradient norm to 1 to limit unusually large updates.
+
+    \subsubsection{Causal masking and sequence handling}
+        I use causal attention so the representation at frame $t$ only uses frames $0{:}t$, then train it against targets from frame $t+1$. I mask padding in both attention and loss computation, and omit prediction at the final frame since there is no subsequent observation.
+
+    \subsubsection{Validation and parameter transfer}
+        I compare prediction errors against a simple persistence baseline, which predicts no change from the current frame, and report results separately by target group. I then transfer the player encoder, spatial transformer, frame projection, and temporal transformer to the final stage, discarding the temporary prediction heads.
 
 \subsection{Fine-Tune - Win Prediction}
+    Finally, I use the representations learned in Stage 2 to predict the winning team from a partially observed match. I replace the dynamics head with a randomly initialized win-prediction MLP, then fine-tune the entire model.
+
+    \subsubsection{Architecture}
+        I use the architecture in Figure~\ref{fig:final-architecture}, taking the temporal representation at the sampled cutoff $T$. I pass this through an MLP with dimensions $64\rightarrow32\rightarrow1$, with ReLU between layers and sigmoid to convert the final logit into a win probability.
+
+    \subsubsection{Prediction targets and prefix sampling}
+        I sample a training match uniformly, then sample a cutoff $T$ uniformly among its eligible recorded frames and give the model only frames $0{:}T$. The target is the final match outcome, encoded as 1 if team 1 wins and 0 otherwise. I exclude terminal frames and any features that explicitly reveal the outcome.
+
+    \subsubsection{Loss function}
+        As in Stage 1, I use binary cross-entropy between the predicted win probability and the observed match outcome, averaged over sampled matches. I compute this directly from logits using \texttt{BCEWithLogitsLoss}, without applying sigmoid beforehand.
+
+    \subsubsection{Optimizer and learning rate}
+        I use AdamW with an initial learning rate of $10^{-5}$ for the transferred backbone and $10^{-4}$ for the new win-prediction head. Initially, I set weight decay to zero. As before, these learning rates are starting values that I may adjust based on validation loss.
+
+    \subsubsection{Batch size and training duration}
+        I use mini-batches of 8 match prefixes and will train for at most 100 epochs, sampling a new cutoff for each training match each epoch. I pad prefixes within each batch as needed and take the temporal output at each prefix's actual cutoff, rather than at a padded position.
+
+    \subsubsection{Regularization and stopping criteria}
+        I retain transformer dropout of $0.1$ and gradient clipping at a total norm of 1. I halt if validation binary cross-entropy does not improve for 10 consecutive epochs, then restore the checkpoint with the lowest validation loss.
+
+    \subsubsection{Causal masking and sequence handling}
+        I retain causal attention and mask padded frames, so each representation only uses the available match history. I also reuse the feature scaling learned from training data; normalizing each match using its complete trajectory would give the model information about the future.
+
+    \subsubsection{Validation}
+        I keep the validation prefixes fixed so I can compare checkpoints without the added variation from new cutoffs. I report binary cross-entropy, Brier score, calibration, and AUC at fixed elapsed times, using only matches still in progress at each time.
 
 
 
+\section{Results}
+    \subsection{Evaluation}
+    \subsection{Conclusion}
+    \subsection{Open Questions}
 
 
 
+\section{Notes}
 
-\section{Evaluation}
-
-\section{Open Questions}
-This architecture incorporates all the targeted, non-mutually exclusive, methods I wanted to exercise:
-\begin{itemize}
-    \item \textbf{Embeddings} - Learned one-hot hero embeddings (like text) with numeric information, rank, to compose a composit embedding.
-    \item \textbf{Transformers} - Using both spatial and temporal attention with different structures.
-    \item \textbf{Parameter sharing} - Using the parameters from one model, or training, inside of another.
-    \item \textbf{Residuals \& Layer Normalizing} - Considerations for regularizing magnitudes, normalizing values between layers for training stability.
-    \item \textbf{Causal Masking \& Temporal Encoding} - Temporal encoding for game state flow, and causul masking to preserve temporal information flow.
-    \item \textbf{Supervised Pre-Training} - Using high-quantity labeled data to learn embeddings.
-    \item \textbf{Self-Supervised Pre-Training} - Using temporal game-state data to learn game dynamics.
-    \item \textbf{Transfer Learning \& Fine-Tuning} - Pre-trained components are reused as trained representation generation for win prediction.
-    \item \textbf{Random-Prefix Training} - Randomly cut temporal observations to train model prediction outs over variable time horizons.
-\end{itemize}
 
 
 \end{document}
