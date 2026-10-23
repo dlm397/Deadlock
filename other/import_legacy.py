@@ -2,7 +2,7 @@
 
 Run from Deadlock2 with its Python environment and installed Node dependencies:
     python other/import_legacy.py --dry-run
-    python other/import_legacy.py
+    python other/import_legacy.py 
     python other/import_legacy.py --match-ids 109521468 --output data_import_check
 
 This is one new entry-point script using Deadlock2's existing normalization and

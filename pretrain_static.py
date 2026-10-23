@@ -1,4 +1,5 @@
-"""Stage 1 of research/model/outline.tex: supervised static player pre-training.
+"""
+Stage 1 of research/model/outline.tex: supervised static player pre-training.
 
 Run `python pretrain_static.py --help` for train, predict, and verify commands.
 Only hero identity and initial_rank_badge enter the player encoder.
