@@ -4,20 +4,16 @@
 data_dir = "../data"
 supplemental_dir = "supplemental"
 
-# Source 2 replay collection. Metadata supports eligibility and identity;
-# successful collection always includes replay parsing.
+# Retained local Source 2 replays -> one full_match.duckdb. No replay downloads.
 [full_match]
 output_dir = "full_match"
 match_ids = []
 match_ids_file = ""
 sampling_interval_s = 20
-retain_replays = true
-export_csv = false
+replay_dir = "full_match/replays" # relative to data_dir; CLI paths are relative to cwd
+batch_size = 1 # maximum attempted matches per invocation, including failures
 retry_failures = false
 rebuild_outputs = false
-# Full-match: 150 games took 370 minutes, ~2.4 minutes/match, ~25 matches/hour.
-discovery_count = 50
-discovery_limit = 600
 api_base = "https://api.deadlock-api.com"
 disable_steam = true
 

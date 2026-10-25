@@ -15,7 +15,8 @@ if (!Array.isArray(roster) || roster.length !== 12 || !Number.isFinite(duration)
   throw Error('Replay extraction requires eligible match metadata with exactly 12 players');
 const slots = new Map(roster.map(p => [p.player_slot, p]));
 if (slots.size !== 12) throw Error('Duplicate or missing metadata player slots');
-const accounts = new Map(roster.filter(p => p.account_id != null).map(p => [String(p.account_id), p.player_slot]));
+const accounts = new Map(roster.filter(p => p.account_id != null && String(p.account_id) !== '0')
+  .map(p => [String(p.account_id), p.player_slot]));
 const stringify = value => JSON.stringify(value, (_, v) => typeof v === 'bigint' ? String(v) :
   ArrayBuffer.isView(v) ? Array.from(v) : v);
 mkdirSync(output, {recursive: true});
@@ -87,7 +88,7 @@ function controllerSlot(controller) {
   const accountSlot = account == null ? null : accounts.get(account);
   if (slots.has(slot)) {
     const expected = slots.get(slot).account_id;
-    if (account != null && expected != null && String(expected) !== account) {
+    if (account != null && expected != null && String(expected) !== '0' && String(expected) !== account) {
       warnings.add('A replay controller disagrees with the metadata roster; its state was left missing.');
       return null;
     }
@@ -164,11 +165,11 @@ function clockState() {
     const time = paused || postgame ? anchor : anchor + Math.max(tick - anchorTick, 0) * secondsPerTick;
     if (time < 0) return null;
     clockMethods.add('match_clock_anchor_and_server_tick');
-    return {time, paused, postgame};
+    return {time, paused, postgame, game_state: finite(state), server_tick: tick};
   }
   if (legacyTime != null) {
     clockMethods.add('game_start_and_pause_adjusted_server_tick');
-    return {time: legacyTime, paused, postgame};
+    return {time: legacyTime, paused, postgame, game_state: finite(state), server_tick: tick};
   }
   return null;
 }
@@ -189,7 +190,7 @@ function position(pawn) {
   return result;
 }
 
-function snapshot(time) {
+function snapshot(time, clock) {
   const controllers = new Map();
   for (const controller of parser.getDemo().getEntitiesByClassName('CCitadelPlayerController')) {
     if (!controller.active) continue;
@@ -220,7 +221,8 @@ function snapshot(time) {
       max_health: finite(field(activePawn, 'm_iMaxHealth') ?? globalField(controller, 'm_iHealthMax')),
       ...position(activePawn), hero_damage_taken: null};
   });
-  return {time, rows};
+  return {time, rows, global: {observed_time_s: time, game_state: clock.game_state,
+    paused: clock.paused, server_tick: clock.server_tick}};
 }
 
 function emitSample(time, observed, isFinal = false) {
@@ -229,7 +231,8 @@ function emitSample(time, observed, isFinal = false) {
     account_id: p.account_id ?? null, hero_id: p.hero_id ?? null, team_id: p.team ?? p.team_id ?? null,
     observed_time_s: null, ...nullableState}));
   pendingSample = {time, rows: (observed?.rows ?? identities).map(row => ({...row,
-    game_time_s: time, is_final_observation: isFinal && row.observed_time_s != null}))};
+    global: observed?.global ?? null, game_time_s: time,
+    is_final_observation: isFinal && row.observed_time_s != null}))};
 }
 
 function acceptSnapshot(current) {
@@ -250,7 +253,8 @@ function acceptSnapshot(current) {
   }
   // Multiple complete network updates can share the same frozen game clock.
   if (pendingSample && pendingSample.time === current.time)
-    pendingSample.rows = current.rows.map(row => ({...row, game_time_s: pendingSample.time, is_final_observation: false}));
+    pendingSample.rows = current.rows.map(row => ({...row, global: current.global,
+      game_time_s: pendingSample.time, is_final_observation: false}));
   previous = current;
 }
 
@@ -264,7 +268,7 @@ function finishTick() {
   // ending rather than truncating it to that integer; the first end marker stops us.
   if (clock.time >= 0 && clock.time <= duration + 1) {
     for (const event of queuedEvents) events.add({...event, game_time_s: clock.time});
-    if (tickHasEntities && !clock.paused && !terminal) acceptSnapshot(snapshot(clock.time));
+    if (tickHasEntities && !clock.paused && !terminal) acceptSnapshot(snapshot(clock.time, clock));
   }
   if (terminal) { terminalTime = clock.time; stopped = true; }
   queuedEvents = [];
@@ -279,6 +283,7 @@ parser.registerPreInterceptor(Stage.DEMO_PACKET, packet => {
     finishTick();
     // An event-only tick must use its new net_Tick, never the prior entity tick.
     serverTick = null;
+    netTick = null;
   }
   demoTick = packet.tick;
 });
@@ -336,7 +341,7 @@ try {
     summary.final_observed_game_time_s = previous.time;
     if (pendingSample && pendingSample.time === previous.time) {
       pendingSample.rows = previous.rows.map(row => ({...row, game_time_s: previous.time,
-        is_final_observation: row.observed_time_s != null}));
+        global: previous.global, is_final_observation: row.observed_time_s != null}));
     } else emitSample(previous.time, previous, true);
   }
   if (pendingSample) for (const row of pendingSample.rows) samples.add(row);

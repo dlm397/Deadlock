@@ -9,10 +9,8 @@ Consider the contents of `research/` for what I am currently doing, and what I h
 Stage 1 static embedding pre-training is implemented in `pretrain_static.py` by Codex using my outline. As I make adjustments, this will be edited.
 
 ## Current Objectives
-- Learn about data structuring for neural network training
-- Reformat data into a better layout
 - Resolve implementation of pretraining 1
-- Evaluate the failure of run 1 of pretraining 1, then tune hyperparameters
+- Evaluate run 1 of pretraining 1, and tune hyperparameters
 
 ## Project layout
 
@@ -22,17 +20,12 @@ Deadlock/
   config/pipelines.toml          # config for paths, and both datasets
   app/                           # all pipeline implementation, SQL, replay parser
   .validation/                   # pipeline tests, fixtures, and other checks
-  research/                      # research artifacts
+  research/                      # analysis and write-ups
   pretrain_static.py             # pretrain 1 codex script
   data/
-    full_match/                  # Source 2 replay-backed dataset
-      matches/<match_id>.parquet
-      end_match/<match_id>.parquet
-      time_slices/<match_id>.parquet
-      events/<match_id>.parquet
-      replays/<match_id>.dem.bz2  # or .dem.zst / .dem
-      collection_status.csv
-      failures.csv
+    full_match/                  # fresh Source 2 replay-backed dataset
+      full_match.duckdb          # all structured data, events, status and provenance
+      replays/<match_id>.dem.zst  # unchanged raw files (.dem.bz2 / .dem also supported)
     end_match/                   # public Parquet data-lake dataset
       end_match.duckdb
       tables/match_player.parquet
@@ -60,12 +53,12 @@ Notes for running the code.
 python -m pip install -r app/requirements.txt
 npm ci --prefix app
 
-# Source 2 replay collection
-python pipeline.py full-match collect
-python pipeline.py full-match collect --match-ids 123456 234567
-python pipeline.py full-match collect --match-file matches.txt --csv
-python pipeline.py full-match reprocess --interval 60
-python pipeline.py full-match retry
+# Local Source 2 replay ingestion (default: one attempt, 20-second snapshots)
+python pipeline.py full-match ingest --replay data/full_match/replays/109507240.dem.zst
+python pipeline.py full-match ingest --limit 10
+python pipeline.py full-match resume --limit 10
+python pipeline.py full-match retry --limit 5
+python pipeline.py full-match reprocess --match-ids 109507240 --interval 40
 
 # Public Parquet lake ingestion
 python pipeline.py end-match collect
@@ -75,8 +68,7 @@ python pipeline.py end-match reprocess
 python pipeline.py end-match retry
 ```
 
-The dataset name is required. Omitting the command defaults to `collect`. Both pipelines accept `--config`, `--match-ids` or`--match-file`, 
-`--retry-failures`, `--rebuild`, and `--csv`. A run with failed collection work saves its logs/summary and exits nonzero.
+The dataset name is required. Full-match defaults to local `ingest`; end-match defaults to `collect`. Both accept `--config`, `--match-ids` or `--match-file`, `--retry-failures`, and `--rebuild`. Only end-match supports `--csv`. Failed work exits nonzero.
 
 
 ## Stage 1 training from DuckDB
@@ -105,10 +97,6 @@ python pretrain_static.py predict --checkpoint "$run/best_model.pt" --players pl
 ## Eligibility, coverage, and failures
 
 Eligibility requires `duration_s > 900`, exactly 12 distinct slots in the complete roster, `game_mode = 1` (Normal), and `match_mode` in `{1, 4}` (Unranked/Ranked). `game_mode = 4` is Street Brawl and is excluded. Missing/conflicting evidence is unverified eligibility and produces no eligible outputs. A capped bulk response cannot establish the full roster count.
-
-`full_match/collection_status.csv` distinguishes `complete`, `replay_pending`, `ineligible`, `unverified_eligibility`, and `failed`; historical `end_match_only` rows remain resumable. It records the sampling interval, final observed gameplay time, replay-end coverage (true/false/unknown), and a short reason. `complete` means all four research tables were written, not necessarily full replay coverage or availability of every optional definition. Coverage is true when an end marker agrees with metadata duration within two seconds, false when observations end clearly earlier, and blank when uncertain. Eligibility and replay coverage are separate: partial replay observations can be retained for an eligible match. The `matches` and `end_match` outputs survive replay retrieval or parsing failure with status `replay_pending`. Full-match collection has no metadata-only success mode. A failed rebuild preserves earlier successful tables and their recorded interval, with the new failure recorded separately.
-
-`full_match/failures.csv` contains active failures with `match_id, stage, reason, attempted_at_utc`. Ordinary runs skip these IDs before querying; `retry` permits another attempt, and successful recovery clears the active failure. Expected per-match failures are reported and collection continues. Unexpected programming errors remain visible with a traceback.
 
 ## Sources
 - [Understanding Deep Learning](https://udlbook.github.io/udlbook/) by Simon J. D. Prince (MIT Press, 2023)

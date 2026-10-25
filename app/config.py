@@ -50,12 +50,12 @@ def load_dataset_config(dataset, path=DEFAULT_CONFIG, overrides=None):
     overrides = {key: value for key, value in (overrides or {}).items() if value is not None}
     config.update(overrides)
     config.update(output_dir=paths[dataset], supplemental_dir=paths["supplemental"], data_dir=paths["data_dir"])
-    boolean_names = ["export_csv", "retry_failures", "rebuild_outputs"]
-    boolean_names += ["retain_replays", "disable_steam"] if dataset == "full_match" else ["retain_shards"]
+    boolean_names = ["retry_failures", "rebuild_outputs"]
+    boolean_names += ["disable_steam"] if dataset == "full_match" else ["export_csv", "retain_shards"]
     for name in boolean_names:
         if type(config.get(name)) is not bool:
             raise ValueError(f"[{dataset}].{name} must be true or false")
-    integer_names = ["discovery_count", "discovery_limit"] if dataset == "full_match" else ["match_limit", "max_files"]
+    integer_names = ["batch_size"] if dataset == "full_match" else ["match_limit", "max_files"]
     for name in integer_names:
         if type(config.get(name)) is not int or config[name] < 1:
             raise ValueError(f"[{dataset}].{name} must be a positive integer")
@@ -74,6 +74,15 @@ def load_dataset_config(dataset, path=DEFAULT_CONFIG, overrides=None):
     if not isinstance(ids, list) or any(type(mid) is not int or not 0 < mid < 2**64 for mid in ids):
         raise ValueError("match_ids must be positive exact uint64 integers")
     config["match_ids"] = list(dict.fromkeys(ids))
+    if dataset == "full_match":
+        config["sampling_interval_explicit"] = "sampling_interval_s" in overrides
+        if config.get("export_csv") or config.get("retain_replays") is False:
+            raise ValueError("Full-match writes only DuckDB and always retains raw replays")
+        replay_dir = config.get("replay_dir")
+        base = Path.cwd() if "replay_dir" in overrides else paths["data_dir"]
+        config["replay_dir"] = (base / replay_dir).resolve() if replay_dir else paths["full_match"] / "replays"
+        if config.get("replay_path"):
+            config["replay_path"] = Path(config["replay_path"]).resolve()
     if dataset == "end_match":
         manifest = str(config["manifest_url"])
         if urlparse(manifest).scheme not in ("http", "https"):
