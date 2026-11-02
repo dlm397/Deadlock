@@ -3,14 +3,24 @@
 The goal of this project is practicing using statistical tools. But, to that end, I first needed data, so I used the Codex tool by OpenAI, to compose a simple data pipe, that downloaded, parsed, and stored game. Now, I have enough games to start doing analysis.
 
 ## Current Research
+Consider the contents of `research/` for what I am currently doing, and what I have done. Currently, I have completed the first implementation of a double pre-train plus fine-tuning win prediction architecture, see [model outline](research/model/buildTex/outline.pdf) which I've been using as empirical practice after finishing Simon J. D. Prince’s [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/). It turned out to be better than some simple baselines, which was surprising, but there are some noteworthy observations.
+1. As compared to the training win frequency as the constant prior, it improved noticably.
+2. There was some major data-related problems that need to be repaired.
+3. Training times were reasonable, the full cycle of training took under 8 hours.
+The static pretraining is implemented, by Codex, in `pretrain_static.py`, which was pointed directly at my [research outline](research/mode/outline.tex).
+The dynamic pretraining is implemented, by Codex, in `pretrain_dynamics.py`, which was also pointed at my [research outline](research/mode/outline.tex).
+The win-preduction fine-tuning is implemented in `finetune_win.py` by Codex, which was again pointed at [research outline](research/mode/outline.tex).
 
-Consider the contents of `research/` for what I am currently doing, and what I have done. As of last updating, I am playing with a double pre-train plus fine-tuning win prediction architecture, see [model outline](research/model/buildTex/outline.pdf), I do not expect this to be fruitful, it is implementation practice concurrent with reading Simon J. D. Prince’s [*Understanding Deep Learning*](https://udlbook.github.io/udlbook/).
 
-Stage 1 static embedding pre-training is implemented in `pretrain_static.py` by Codex using my outline. As I make adjustments, this will be edited.
+### A Long Term Objective
+
+As a long term objective, I am considering different scoring mechanisms. I was inspired by discussion in Prince's textbook about weather prediction models. When predicting weather, it was common for older models, trained simply to predict tomorrow's weather from today's, to collapse to "tomorrow is the same as today" because following this method is correct >90% of the time. So, to get models that can produce meaningful results, there was and is, significant research into training models to produce these less liklely outcomes. I want to take this logic and apply it to win-prediction.
+
+When looking at many deadlock matches, predicting the winner is often quite easy. >60% of games are decided by half way (as observed by soul advantage, map state, etc). For a model simply seeking to predict the winning team, this provides a training signal not totally aligned with the interesting component of win-prediction. Rather, I care more particularly about close matches, matches that do not have an immediately obvious outcome. Hence, similar to a weather model, I want to compose a model that may not necessarily have the highest percentage of correct guesses, but rather, have the highest precent of correct guesses on games that are extremely close.  
 
 ## Current Objectives
-- Resolve implementation of pretraining 1
-- Evaluate run 1 of pretraining 1, and tune hyperparameters
+- Consider improvements to each step, including hyperparameter adjustment, algorithm changes, and some small architectural changes.
+- Begin composing ideas for a second architecture, designed around the idea described in "A Longer Term Objective".
 
 ## Project layout
 
