@@ -10,12 +10,18 @@
 \usepackage{float}
 \usepackage{booktabs,tabularx,array}
 
-\title{Model Version 1 Outline}
+\title{Model 1 Outline}
 \author{}
 \date{}
 
 \begin{document}
 \maketitle
+
+\begin{abstract}
+    This is an outline for my first model. The goal was the exercise the different components I learned about in Prince's Understanding Deep Learning. It was a successful experiement, and good practice. I have two goals the next two models will build on.
+    First, I want to experiment with synthetic data, the last few chapters of the book were about generative models, so I want to try building a generative model for different bits of these two datasets. Second, I want to refine this model a bit, get some stronger results, 
+    then attach a conformal predictor to it, as further practice. Since finishing Prince's book, I have begun reading "a gentle introduction to conformal prediction and distribution-free uncertainty quantification".
+\end{abstract}
 
 
 \section{Objective}
@@ -566,21 +572,15 @@
 
 
 
-\clearpage
 \section{Initial Results}
-    I use this section to collect what I learned from the completed runs and
-    decide what I would try next. These are validation results from checkpoints
-    selected using validation loss; I have not evaluated the reserved test sets.
-    My improvement ideas below keep the current architecture unless explicitly
-    described as a change to the prediction task.
+    This section is a both a summary of my completed first run, and some brainstorming for next step/improvements.
 
-\subsection{Embedding Pre-Training (Stage 1)}
+\subsection{Embedding Pre-Train (Stage 1)}
 \subsubsection{Summary Statistics}
-    I trained the static encoder using only pre-match hero selections and ranks
-    from the end-of-match database. Table~\ref{tab:static-results} summarizes the
-    saved run; the constant-probability reference is the analytical BCE for
-    predicting $p=0.5$ on every match, not a fitted class-prior baseline.
-
+    I trained the static encoder using only pre-match hero selections and ranks from the end-of-match database. 
+    Table~\ref{tab:static-results} summarizes the saved run; the constant-probability reference is the BCE for
+    predicting $p=0.5$ on every match.
+% Pretrain 1 stat table
     \begin{table}[H]
     \centering
     \small
@@ -604,52 +604,26 @@
     \label{tab:static-results}
     \end{table}
 
-    \paragraph{What went wrong.}
-    I had very little observed rank information, so median imputation made the
-    rank channel identical for most players. Validation loss also worsened after
-    the selected checkpoint while training loss kept falling, which suggests
-    some overfitting rather than a benefit from simply training longer.
+\subsubsection{Issues}
+    Rank information was very sparse, >90\% of observations did not have a rank. Median imputation can only do so much. 
+    Also, validation loss worsened after the selected checkpoint, and training loss kept falling, so it was overfitting.
 
-    \paragraph{Interpretation.}
-    \begin{itemize}
-        \item I see a modest improvement over the constant-probability reference,
-        but I still need a training-prior baseline to judge the contribution of
-        hero and rank information more directly.
-        \item I cannot tell how much rank helped from this run. Missing or zero
-        ranks were replaced by the training median before training-only min--max
-        scaling, so imputation preserved the input shape without recovering
-        missing information.
-        \item I have a reproducible encoder to transfer, but I have not yet
-        established that its initialization improves the later stages. This
-        run also did not save AUC, Brier score, or calibration metrics.
-    \end{itemize}
+\subsubsection{Improvement}
+    I need a more complex embedding structure, or a different type of training objective. Their is obvious benefit to embedding 
+    clearly, hero selection is a strong predictor, but I need to find a way to get that information more reliably, and to 
+    use all the information available.
 
-    \paragraph{Summary.}
-    I would keep this checkpoint as my initial static representation. The loss
-    curve gives me a reason to retain early stopping, while the rank audit makes
-    data quality and stronger comparisons more useful next steps than increasing
-    the model's size.
+    I must consider how I want to deal with the missing rank information. Either I can simply use the reduced number of runs, 
+    since I already seem to have more than I need, or I can remove rank.
 
-\subsubsection{Possible Improvements}
-    \begin{enumerate}
-        \item I would first investigate whether I can recover more genuinely
-        pre-match ranks, then report results separately for matches with and
-        without observed ranks. I would keep terminal statistics out of the inputs.
-        \item I would compare against a constant training-prior predictor and
-        a hero-only control with the rank channel fixed, using the same splits.
-        I would also save Brier score, AUC, and calibration alongside BCE.
-        \item I would try a smaller learning rate, such as $3\times10^{-4}$,
-        then separately try AdamW weight decay of $10^{-4}$. I would change one
-        setting at a time and retain the best validation checkpoint.
-    \end{enumerate}
+    I will certainly keep early stopping. But I am considering weight decay, dropouts, and learning rate decay.
 
-\subsection{Dynamics Pre-Training (Stage 2)}
+
+\subsection{Dynamics Pre-Train (Stage 2)}
 \subsubsection{Summary Statistics}
-    I predicted the next one-second change in team soul lead,
-    $\Delta(\text{team 1 net worth}-\text{team 0 net worth})$.
-    I averaged squared error within each match and then across matches, so long
-    matches did not receive more weight. My persistence reference predicts no
-    change in the lead.
+    The objective I used was to predict the next one-second change in team soul lead, $\Delta(\text{team 1 net worth}-\text{team 0 net worth})$.
+    I averaged squared error within each match and then across matches, so long matches did not receive more weight. 
+    Persistence predicts no change in the lead.
 
     \begin{table}[H]
     \centering
@@ -678,60 +652,20 @@
     \label{tab:dynamics-results}
     \end{table}
 
-    \paragraph{What went wrong.}
-    My first attempt spilled into shared GPU memory and had to be restarted
-    using gradient accumulation with one match per device micro-batch.
-    In the completed run, training loss continued falling after validation
-    performance stopped improving.
+\subsubsection{Issues}
+    I had to make some adjustment to how the batches were loaded, as it would not fit in memory. 
+    Also, there was also clear overfitting, as the validation loss was increasing while training loss was decreasing.
 
-    \paragraph{Interpretation.}
-    \begin{itemize}
-        \item I learned something beyond persistence even over a short interval.
-        The MSE reduction is encouraging, but the corresponding reduction in
-        RMSE is smaller; neither number is an improvement in win accuracy.
-        \item I should treat matches as the independent evaluation units.
-        Many adjacent frames give me more training targets, not an equally large
-        set of independent examples.
-        \item I cannot infer useful transfer to win prediction from this loss
-        alone. I would need a fine-tuning comparison with and without dynamics
-        pre-training to test that claim.
-    \end{itemize}
+\subsubsection{Improvements}
+    I think I'll try to reduce the learning rate for the transferred encoder. Because of overfitting, I also plan on trying 
+    dropouts, weight decay, and learning rate decay. I may also try adjusting the window of prediction from 1 second to 5 seconds.
 
-    \paragraph{Summary.}
-    I think this is a reasonable first dynamics checkpoint: it beats the stated
-    baseline, and the memory fix preserved the time resolution and effective
-    batch size. I would next investigate optimization and where the remaining
-    errors occur. The suggestions below are still proposals; I have not
-    implemented them or retrained Stage 2.
 
-\subsubsection{Possible Improvements}
-    \begin{enumerate}
-        \item I would try $3\times10^{-5}$ for the transferred encoder or
-        $3\times10^{-4}$ for the new components, changing one group at a time.
-        Another trial could halve learning rates when validation MSE plateaus.
-        I would retain clipping, early stopping, and equal weight per match.
-        \item I would separately test dropout of $0.2$ or weight decay of
-        $10^{-4}$ to see whether either reduces the late training--validation
-        divergence without suppressing useful learning.
-        \item I would inspect residuals by elapsed time and target magnitude.
-        If rare large errors dominate, I could try Huber loss while still
-        reporting the original MSE, RMSE, and persistence comparison.
-        \item I might try predicting the change over five seconds. That changes
-        the task, so I would fit new target scaling on training data and use a
-        matching five-second persistence baseline rather than compare raw errors
-        directly with the one-second experiment.
-        \item I would repeat promising settings across seeds with the same
-        splits, and compare their eventual fine-tuning performance before
-        deciding which dynamics checkpoint is most useful.
-    \end{enumerate}
-
-\clearpage
-\subsection{Win-Prediction Fine-Tuning}
+\subsection{Win-Prediction Fine-Tune}
 \subsubsection{Summary Statistics}
-    I compared both runs on exactly the same fixed validation prefixes.
-    Both started from the same Stage 2 checkpoint, used seed 42, and retained
-    the architecture, preprocessing, match splits, and uniform per-match prefix
-    sampling. I used the training win frequency as the constant-prior baseline.
+    I conducted two runs of this fine-tune. So, I compared both runs on the same validation prefixes. Both started from the 
+    same Stage 2 checkpoint, used the same seed, and retained the architecture, preprocessing, match splits, and 
+    uniform per-match prefix sampling. I used the training win frequency as the constant baseline.
 
     \begin{table}[H]
     \centering
@@ -768,85 +702,10 @@
     \label{tab:finetune-results}
     \end{table}
 
-    I kept the head learning rate at $10^{-4}$, weight decay at zero, effective
-    batch size at eight, and micro-batch size at one. In Run 2, the plateau
-    scheduler halved both rates after three consecutive non-improving validation
-    epochs, with floors at $1\%$ of the initial rates; it did not reset the
-    ten-epoch early-stopping counter.
+\subsubsection{Issues}
+    Both runs suffered from clear overfitting. 
 
-    \begin{table}[H]
-    \centering
-    \small
-    \renewcommand{\arraystretch}{1.15}
-    \begin{tabular}{rrrrrr}
-    \toprule
-    & & \multicolumn{2}{c}{\textbf{BCE}} & \multicolumn{2}{c}{\textbf{AUC}} \\
-    \cmidrule(lr){3-4} \cmidrule(lr){5-6}
-    \textbf{Minutes} & \textbf{Matches} & \textbf{Run 1} & \textbf{Run 2} & \textbf{Run 1} & \textbf{Run 2} \\
-    \midrule
-     5 & 116 & 0.680981 & 0.686303 & 0.607738 & 0.622024 \\
-    10 & 116 & 0.681588 & 0.685082 & 0.620238 & 0.618452 \\
-    15 & 116 & 0.631442 & 0.621901 & 0.722024 & 0.711607 \\
-    20 & 116 & 0.601270 & 0.592113 & 0.745238 & 0.751786 \\
-    30 &  88 & 0.529428 & 0.508398 & 0.830825 & 0.831863 \\
-    \bottomrule
-    \end{tabular}
-    \caption{Validation at fixed elapsed times. Cohorts match between runs at
-    each time; the final row includes only matches still in progress.}
-    \label{tab:finetune-time-results}
-    \end{table}
-
-    \paragraph{What went wrong.}
-    My first run continued fitting its training prefixes while validation BCE
-    worsened, suggesting overfitting, although new sampled prefixes and dropout
-    make the two losses imperfectly comparable. My second run improved aggregate
-    BCE only slightly, while early-game BCE and aggregate calibration error worsened.
-
-    \begin{samepage}
-    \paragraph{Interpretation.}
-    \begin{itemize}
-        \item I see useful discrimination beyond the prior baseline, but a low
-        ECE alone would not establish that: the nearly constant prior has little
-        calibration error while providing no ranking of matches.
-        \item I cannot call the second run a reliable overall improvement yet.
-        The paired interval includes zero and does not account for checkpoint
-        or hyperparameter selection on this same validation set.
-        \item I see the BCE gains mainly later in matches. The final time cohort
-        is smaller, so I should not attribute its stronger scores entirely to
-        observing more history.
-        \item I cannot separate the effects of the lower backbone learning rate
-        and increased dropout. Scheduler reductions occurred only after
-        the selected checkpoint, so they did not improve
-        the retained model.
-    \end{itemize}
-    \end{samepage}
-
-    \paragraph{Summary.}
-    I would keep the second checkpoint as the current candidate because it has
-    the lowest observed validation BCE, but I would describe the gain as small
-    and uncertain. It cost more training time and did not improve every metric
-    or stage of the match. My next experiments should explain the tradeoffs and
-    check repeatability before I use the reserved test matches for a final evaluation.
-
-\subsubsection{Possible Improvements}
-    \begin{enumerate}
-        \item I would isolate the learning-rate and dropout changes in separate
-        runs from the same Stage 2 checkpoint, then repeat promising settings
-        across seeds. I would keep the validation prefixes fixed for comparison.
-        \item I would test a short head-only warm-up before unfreezing the
-        backbone, or modest weight decay, as separate ways of limiting disruptive
-        updates. I would compare each against the current training procedure.
-        \item If early-game prediction is my priority, I would try sampling
-        cutoffs within elapsed-time bands and averaging losses equally across
-        those bands. I would state that this changes the training objective
-        and report both aggregate and time-specific validation results.
-        \item I would inspect calibration by elapsed time and consider fitting
-        a temperature on a separate calibration subset, rather than using test
-        outcomes or assuming better AUC means better probabilities.
-        \item I would compare against a simple current-soul-lead predictor and
-        a model trained without dynamics pre-training. Those controls would
-        help me decide whether the temporal representation and pre-training
-        provide enough benefit to justify the training cost.
-    \end{enumerate}
+\subsubsection{Improvements}
+    The same as the both pretraining stages, I want to try dropouts, weight decay, and learning rate decay. 
 
 \end{document}
