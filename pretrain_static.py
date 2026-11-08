@@ -1,5 +1,5 @@
 """
-Stage 1 of research/model/outline.tex: supervised static player pre-training.
+Stage 1 of research/model_one/outline.tex: supervised static player pre-training.
 
 Run `python pretrain_static.py --help` for train, predict, and verify commands.
 Read the selected match_player view in the end-match DuckDB database.
@@ -24,7 +24,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from app.console_log import log
-from app.config import DEFAULT_CONFIG, data_paths
+from app.config import DEFAULT_CONFIG, data_paths, model_output_dir, resolve_saved_path
 
 
 ROOT = Path(__file__).resolve().parent
@@ -251,6 +251,7 @@ def rank_report(matches):
 
 
 def load_stage1(checkpoint_path, device="cpu"):
+    checkpoint_path = resolve_saved_path(checkpoint_path, base=Path.cwd())
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if checkpoint["kind"] != "stage1_complete" or checkpoint["architecture"] != ARCHITECTURE:
         raise ValueError("Expected a compatible complete Stage 1 checkpoint")
@@ -279,6 +280,9 @@ def validation_bce(model, loader, device):
 
 def verify_reload(checkpoint_path, reference_path=None):
     """Compare independent CPU reload with predictions recorded from the best model."""
+    checkpoint_path = resolve_saved_path(checkpoint_path, base=Path.cwd())
+    if reference_path is not None:
+        reference_path = resolve_saved_path(reference_path, base=Path.cwd())
     reference_path = reference_path or checkpoint_path.parent / "reload_reference.pt"
     reference = torch.load(reference_path, map_location="cpu", weights_only=True)
     model, _ = load_stage1(checkpoint_path)
@@ -305,6 +309,7 @@ def plot_history(history, path):
 
 
 def train(args):
+    args.output_dir = model_output_dir(args, "pretrain_static")
     if not 1 <= args.epochs <= 100 or not 1 <= args.patience <= 10 or args.batch_size < 1:
         raise ValueError("Require epochs 1..100, patience 1..10, and positive batch size")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
@@ -423,19 +428,20 @@ def train(args):
 
 def resolve_data_dir(args):
     if args.database is not None:
-        return args.database.resolve().parent
+        return resolve_saved_path(args.database, args.config, base=Path.cwd()).parent
     if args.data_dir is not None:
-        return args.data_dir.resolve()
+        return resolve_saved_path(args.data_dir, args.config, base=Path.cwd())
     return data_paths(args.config)["end_match"]
 
 
 def resolve_database(args):
-    return args.database.resolve() if args.database is not None else resolve_data_dir(args) / "end_match.duckdb"
+    return (resolve_saved_path(args.database, args.config, base=Path.cwd()) if args.database is not None
+            else resolve_data_dir(args) / "end_match.duckdb")
 
 
 def resolve_split_path(args, data_dir):
     if args.splits:
-        return args.splits.resolve()
+        return resolve_saved_path(args.splits, args.config, base=Path.cwd())
     if args.data_dir is None and args.database is None:
         return data_paths(args.config)["supplemental"] / "splits.csv"
     return (data_dir / "splits.csv").resolve()
@@ -453,7 +459,7 @@ def build_parser():
         location.add_argument("--database", type=Path, help="Override the configured end-match DuckDB file")
         location.add_argument("--data-dir", type=Path, help="Directory containing end_match.duckdb")
         command.add_argument("--device", default="cpu")
-    training.add_argument("--output-dir", type=Path, default=ROOT / "data" / "supplemental" / "pretrain_static")
+    training.add_argument("--output-dir", type=Path, help="Default: configured supplemental/pretrain_static")
     training.add_argument("--splits", type=Path, help="Match split CSV; default: shared supplemental/splits.csv, or beside an explicitly selected database")
     training.add_argument("--extend-splits", action="store_true", help="Assign new match IDs while preserving every existing split assignment")
     training.add_argument("--seed", type=int, default=42)
@@ -478,6 +484,7 @@ def main():
     if args.command == "train":
         train(args)
     elif args.command == "predict":
+        args.checkpoint = resolve_saved_path(args.checkpoint, args.config, base=Path.cwd())
         model, checkpoint = load_stage1(args.checkpoint, args.device)
         players = (json.loads(args.players.read_text(encoding="utf-8")) if args.players
                    else read_players(resolve_database(args), args.match_id))

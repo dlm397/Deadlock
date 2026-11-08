@@ -19,7 +19,7 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
-from app.config import DEFAULT_CONFIG
+from app.config import DEFAULT_CONFIG, model_output_dir, resolve_saved_path
 from app.console_log import log
 import pretrain_static as static
 import pretrain_dynamics as dynamics
@@ -53,6 +53,7 @@ class WinModel(dynamics.DynamicsModel):
 
 
 def load_stage2_checkpoint(path):
+    path = resolve_saved_path(path, base=Path.cwd())
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if (checkpoint.get("kind") not in ("stage2_complete", "stage2_transfer")
             or checkpoint.get("architecture") != dynamics.ARCHITECTURE):
@@ -326,6 +327,7 @@ def plot_results(history, fixed_metrics, directory):
 
 
 def load_stage3(path, device="cpu"):
+    path = resolve_saved_path(path, base=Path.cwd())
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if checkpoint.get("kind") != "stage3_complete" or checkpoint.get("architecture") != ARCHITECTURE:
         raise ValueError("Expected a compatible complete Stage 3 checkpoint")
@@ -336,7 +338,9 @@ def load_stage3(path, device="cpu"):
 
 
 def verify_reload(path, reference_path=None):
-    path = Path(path)
+    path = resolve_saved_path(path, base=Path.cwd())
+    if reference_path is not None:
+        reference_path = resolve_saved_path(reference_path, base=Path.cwd())
     reference = torch.load(reference_path or path.parent / "reload_reference.pt", weights_only=True, map_location="cpu")
     model, _ = load_stage3(path)
     with torch.inference_mode():
@@ -378,6 +382,8 @@ def create_lr_scheduler(optimizer, args):
 
 
 def train(args):
+    args.output_dir = model_output_dir(args, "finetune_win")
+    args.dynamics_checkpoint = resolve_saved_path(args.dynamics_checkpoint, args.config, base=Path.cwd())
     validate_settings(args)
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(args.seed)
@@ -532,6 +538,7 @@ def train(args):
 
 @torch.inference_mode()
 def predict(args):
+    args.checkpoint = resolve_saved_path(args.checkpoint, args.config, base=Path.cwd())
     validate_times([args.through_time])
     model, checkpoint = load_stage3(args.checkpoint, args.device)
     database = dynamics.resolve_database(args)
@@ -555,6 +562,9 @@ def predict(args):
 
 
 def evaluate_checkpoint(args):
+    args.checkpoint = resolve_saved_path(args.checkpoint, args.config, base=Path.cwd())
+    if args.output_dir is not None:
+        args.output_dir = resolve_saved_path(args.output_dir, args.config, base=Path.cwd())
     validate_times(args.evaluation_times)
     model, checkpoint = load_stage3(args.checkpoint, args.device)
     database = dynamics.resolve_database(args)
@@ -594,7 +604,7 @@ def build_parser():
     for command in (training, evaluation):
         command.add_argument("--evaluation-times", type=float, nargs="+", default=[300, 600, 900, 1200, 1800])
     training.add_argument("--dynamics-checkpoint", type=Path, required=True)
-    training.add_argument("--output-dir", type=Path, default=ROOT / "data/supplemental/finetune_win")
+    training.add_argument("--output-dir", type=Path, help="Default: configured supplemental/finetune_win")
     training.add_argument("--splits", type=Path, help="Optional shared split CSV consistency check; never rewritten")
     training.add_argument("--match-ids", type=int, nargs="+", help="Subset of the Stage 2 active match IDs")
     training.add_argument("--seed", type=int, default=42)

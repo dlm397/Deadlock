@@ -16,6 +16,7 @@ import duckdb
 import requests
 
 from .console_log import log
+from .config import data_paths
 
 DEFAULT_MANIFEST = "https://data.deadlock-api.com/v1/manifest.json"
 REQUIRED_COLUMNS = {
@@ -54,7 +55,8 @@ def _positive_int(value, name):
 
 def _settings(config):
     settings = dict(config)
-    settings["output_dir"] = Path(settings.get("output_dir", "data/end_match")).resolve()
+    settings["output_dir"] = (Path(settings["output_dir"]).resolve() if settings.get("output_dir")
+                              else data_paths()["end_match"])
     settings["match_limit"] = _positive_int(settings.get("match_limit", 300), "match_limit")
     settings["max_files"] = _positive_int(settings.get("max_files", 1), "max_files")
     size = settings.get("max_download_mib", 32)

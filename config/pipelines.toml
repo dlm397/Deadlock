@@ -1,7 +1,7 @@
-# data_dir is relative to this config folder. Dataset output_dir and
+# data_dir may be absolute or relative to this config folder. Dataset output_dir and
 # supplemental_dir are relative to data_dir and must stay inside it.
 [paths]
-data_dir = "../data"
+data_dir = "D:/data/deadlock"
 supplemental_dir = "supplemental"
 
 # Retained local Source 2 replays -> one full_match.duckdb. No replay downloads.

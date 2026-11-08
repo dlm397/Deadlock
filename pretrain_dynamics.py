@@ -20,7 +20,7 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
-from app.config import DEFAULT_CONFIG, data_paths
+from app.config import DEFAULT_CONFIG, data_paths, model_output_dir, resolve_saved_path
 from app.console_log import log
 import pretrain_static as static
 
@@ -280,6 +280,7 @@ class DynamicsModel(nn.Module):
 
 
 def load_static_checkpoint(path):
+    path = resolve_saved_path(path, base=Path.cwd())
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if (checkpoint.get("kind") not in ("stage1_transfer", "stage1_complete")
             or checkpoint.get("architecture") != static.ARCHITECTURE):
@@ -390,6 +391,7 @@ def evaluate(model, loader, preprocessing, device="cpu"):
 
 
 def load_stage2(path, device="cpu"):
+    path = resolve_saved_path(path, base=Path.cwd())
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if checkpoint.get("kind") != "stage2_complete" or checkpoint.get("architecture") != ARCHITECTURE:
         raise ValueError("Expected a compatible complete Stage 2 checkpoint")
@@ -400,7 +402,9 @@ def load_stage2(path, device="cpu"):
 
 
 def verify_reload(path, reference_path=None):
-    path = Path(path)
+    path = resolve_saved_path(path, base=Path.cwd())
+    if reference_path is not None:
+        reference_path = resolve_saved_path(reference_path, base=Path.cwd())
     reference = torch.load(reference_path or path.parent / "reload_reference.pt", weights_only=True, map_location="cpu")
     model, _ = load_stage2(path)
     with torch.inference_mode():
@@ -450,6 +454,8 @@ def audit_sequences(database, groups, preprocessing):
 
 
 def train(args):
+    args.output_dir = model_output_dir(args, "pretrain_dynamics")
+    args.static_checkpoint = resolve_saved_path(args.static_checkpoint, args.config, base=Path.cwd())
     if not 1 <= args.epochs <= 100 or not 1 <= args.patience <= 10 or args.batch_size < 1:
         raise ValueError("Require epochs 1..100, patience 1..10, and positive batch size")
     if args.frame_stride < 1 or not 0 <= args.dropout < 1:
@@ -601,17 +607,19 @@ def train(args):
 
 def resolve_database(args):
     if args.database is not None:
-        return args.database.resolve()
+        return resolve_saved_path(args.database, args.config, base=Path.cwd())
     return data_paths(args.config)["full_match"] / "full_match.duckdb"
 
 
 def resolve_split_path(args):
     # Always share Stage 1 assignments, including when selecting another database.
-    return args.splits.resolve() if args.splits else data_paths(args.config)["supplemental"] / "splits.csv"
+    return (resolve_saved_path(args.splits, args.config, base=Path.cwd()) if args.splits
+            else data_paths(args.config)["supplemental"] / "splits.csv")
 
 
 @torch.inference_mode()
 def predict(args):
+    args.checkpoint = resolve_saved_path(args.checkpoint, args.config, base=Path.cwd())
     if not math.isfinite(args.through_time) or args.through_time < 0:
         raise ValueError("through-time must be a nonnegative finite gameplay time")
     model, checkpoint = load_stage2(args.checkpoint, args.device)
@@ -639,7 +647,7 @@ def build_parser():
         command.add_argument("--database", type=Path, help="Full-match DuckDB override (opened read-only)")
         command.add_argument("--device", default="cpu")
     training.add_argument("--static-checkpoint", type=Path, required=True, help="Stage 1 static_encoder.pt or best_model.pt")
-    training.add_argument("--output-dir", type=Path, default=ROOT / "data/supplemental/pretrain_dynamics")
+    training.add_argument("--output-dir", type=Path, help="Default: configured supplemental/pretrain_dynamics")
     training.add_argument("--splits", type=Path, help="Shared match_id,split CSV; must agree with Stage 1")
     training.add_argument("--extend-splits", action="store_true", help="Assign previously unseen IDs without reassigning Stage 1 matches")
     training.add_argument("--match-ids", type=int, nargs="+", help="Explicit subset for a bounded training experiment")

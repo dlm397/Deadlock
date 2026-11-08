@@ -10,8 +10,43 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "config" / "pipelines.toml"
 
 
+def resolve_saved_path(value, config=DEFAULT_CONFIG, *, base=None):
+    """Resolve portable data/... references and paths saved before the repo moved.
+
+    Only known project roots are rebased; explicit paths elsewhere stay explicit.
+    Relative non-data paths use the repository unless a CLI supplies its cwd.
+    Historical checkpoints need not be rewritten (their hashes stay valid).
+    """
+    path = Path(value).expanduser()
+    relative = path if not path.is_absolute() else None
+    if path.is_absolute():
+        old_desktop = Path.home() / "OneDrive - Drexel University" / "Desktop" / "VS Code"
+        for project in (ROOT, old_desktop / "Deadlock", old_desktop / "Deadlock2"):
+            if path.is_relative_to(project):
+                relative = path.relative_to(project)
+                break
+    if relative is not None:
+        if relative.parts and relative.parts[0].lower() == "data":
+            root = data_paths(config)["data_dir"]
+            target = (root / Path(*relative.parts[1:])).resolve()
+            if not target.is_relative_to(root):
+                raise ValueError("Saved data path escapes data_dir")
+            return target
+        if relative.parts[:2] == ("research", "model"):
+            relative = Path("research/model_one") / Path(*relative.parts[2:])
+        return ((ROOT if path.is_absolute() or base is None else Path(base)) / relative).resolve()
+    return path.resolve()
+
+
+def model_output_dir(args, stage):
+    """Keep explicit CLI outputs, otherwise use this invocation's shared config."""
+    if args.output_dir is not None:
+        return resolve_saved_path(args.output_dir, args.config, base=Path.cwd())
+    return data_paths(args.config)["supplemental"] / stage
+
+
 def read_config(path=DEFAULT_CONFIG):
-    path = Path(path).resolve()
+    path = resolve_saved_path(path, base=Path.cwd())
     with path.open("rb") as stream:
         document = tomllib.load(stream)
     for section in ("paths", "full_match", "end_match"):
@@ -66,9 +101,8 @@ def load_dataset_config(dataset, path=DEFAULT_CONFIG, overrides=None):
     ids = config.get("match_ids", [])
     input_file = config.get("match_ids_file")
     if input_file and "match_ids" not in overrides:
-        file = Path(input_file)
-        if "match_ids_file" not in overrides:
-            file = path.parent / file
+        base = Path.cwd() if "match_ids_file" in overrides else path.parent
+        file = resolve_saved_path(input_file, path, base=base)
         text = " ".join(line.split("#", 1)[0] for line in file.read_text(encoding="utf-8-sig").splitlines())
         ids = [int(token) for token in text.replace(",", " ").split()]
     if not isinstance(ids, list) or any(type(mid) is not int or not 0 < mid < 2**64 for mid in ids):
@@ -80,12 +114,13 @@ def load_dataset_config(dataset, path=DEFAULT_CONFIG, overrides=None):
             raise ValueError("Full-match writes only DuckDB and always retains raw replays")
         replay_dir = config.get("replay_dir")
         base = Path.cwd() if "replay_dir" in overrides else paths["data_dir"]
-        config["replay_dir"] = (base / replay_dir).resolve() if replay_dir else paths["full_match"] / "replays"
+        config["replay_dir"] = (resolve_saved_path(replay_dir, path, base=base)
+                                if replay_dir else paths["full_match"] / "replays")
         if config.get("replay_path"):
-            config["replay_path"] = Path(config["replay_path"]).resolve()
+            config["replay_path"] = resolve_saved_path(config["replay_path"], path, base=Path.cwd())
     if dataset == "end_match":
         manifest = str(config["manifest_url"])
         if urlparse(manifest).scheme not in ("http", "https"):
             base = Path.cwd() if "manifest_url" in overrides else path.parent
-            config["manifest_url"] = str((base / manifest).resolve())
+            config["manifest_url"] = str(resolve_saved_path(manifest, path, base=base))
     return config
